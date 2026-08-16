@@ -1,643 +1,113 @@
-name: Windows RDP + Moonlight V2
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  windows-pc:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-
-      # =========================================================
-      # RDP
-      # =========================================================
-      - name: Enable RDP
-        shell: powershell
+      - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Value 0 `
-            -Force
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Value 0 `
-            -Force
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' `
-            -Value 0 `
-            -Force
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-
-          netsh advfirewall firewall add rule `
-            name="RDP-Tailscale" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=3389
-
-          Restart-Service TermService -Force
-
-
-      # =========================================================
-      # CREATE RDP USER
-      # =========================================================
-      - name: Create RDP account
-        shell: powershell
+      - name: Create RDP User with Secure Password
         run: |
-          $upper = [char[]](65..90)
-          $lower = [char[]](97..122)
-          $num = [char[]](48..57)
-
-          $special =
-            [char[]](33..47) +
-            [char[]](58..64) +
-            [char[]](91..96) +
-            [char[]](123..126)
-
-          $chars = @()
-
-          $chars += $upper | Get-Random -Count 4
-          $chars += $lower | Get-Random -Count 4
-          $chars += $num | Get-Random -Count 4
-          $chars += $special | Get-Random -Count 4
-
-          $password = -join ($chars | Sort-Object { Get-Random })
-
-          $secure = ConvertTo-SecureString `
-            $password `
-            -AsPlainText `
-            -Force
-
-          if (Get-LocalUser RDP -ErrorAction SilentlyContinue) {
-            Remove-LocalUser RDP
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          New-LocalUser `
-            RDP `
-            -Password $secure `
-            -AccountNeverExpires `
-            -PasswordNeverExpires
-
-          Add-LocalGroupMember `
-            -Group Administrators `
-            -Member RDP
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member RDP
-
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-
-
-      # =========================================================
-      # TAILSCALE INSTALL
-      # =========================================================
       - name: Install Tailscale
-        shell: powershell
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          $file = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest `
-            $url `
-            -OutFile $file
-
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i","`"$file`"","/quiet","/norestart" `
-            -Wait
-
-          Remove-Item `
-            $file `
-            -Force
-
-          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          if (-not (Test-Path $tailscale)) {
-            Write-Error "Tailscale installation failed."
-            exit 1
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
           }
-
-
-      # =========================================================
-      # TAILSCALE CONNECT
-      # =========================================================
-      - name: Connect Tailscale
-        shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            Write-Error "Missing repository secret TAILSCALE_AUTH_KEY"
-            exit 1
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
           }
-
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $ts logout 2>$null
-
-          & $ts up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="github-rdp-$env:GITHUB_RUN_ID" `
-            --accept-dns=false
-
-          Start-Sleep -Seconds 8
-
-          Write-Host ""
-          Write-Host "========== TAILSCALE STATUS =========="
-
-          & $ts status
-
-          $ip = $null
-
-          for ($i = 0; $i -lt 20; $i++) {
-
-            $ips = & $ts ip -4 2>$null
-
-            foreach ($x in $ips) {
-
-              $x = $x.Trim()
-
-              if ($x -match '^100\.(\d{1,3}\.){2}\d{1,3}$') {
-                $ip = $x
-                break
-              }
-            }
-
-            if ($ip) {
-              break
-            }
-
-            Start-Sleep -Seconds 3
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
+          Write-Host "TCP connectivity successful!"
 
-          if (-not $ip) {
-            Write-Error "Tailscale IPv4 was not assigned."
-            exit 1
-          }
-
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "WINDOWS RUNNER TAILSCALE IP:"
-          Write-Host "$ip"
-          Write-Host "======================================"
-
-          Write-Host "Computer: $env:COMPUTERNAME"
-          Write-Host "Runner user: $env:USERNAME"
-
-
-      # =========================================================
-      # VERIFY RDP
-      # =========================================================
-      - name: Verify RDP
-        shell: powershell
+      - name: Maintain Connection
         run: |
-          Write-Host "=== RDP LISTENER ==="
-
-          Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
-            -ErrorAction SilentlyContinue |
-            Format-Table LocalAddress,LocalPort,State,OwningProcess
-
-          $test = Test-NetConnection `
-            127.0.0.1 `
-            -Port 3389 `
-            -InformationLevel Quiet
-
-          if (-not $test) {
-            Write-Error "RDP is not listening on port 3389."
-            exit 1
-          }
-
-          Write-Host "RDP OK."
-
-
-      # =========================================================
-      # GPU
-      # =========================================================
-      - name: Check GPU
-        shell: powershell
-        run: |
-          Write-Host "======================================"
-          Write-Host "GPU INFORMATION"
-          Write-Host "======================================"
-
-          Get-CimInstance Win32_VideoController |
-            Select-Object `
-              Name,
-              DriverVersion,
-              VideoProcessor,
-              AdapterRAM |
-            Format-List
-
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "DISPLAY"
-          Write-Host "======================================"
-
-          Get-CimInstance Win32_DesktopMonitor |
-            Select-Object `
-              Name,
-              ScreenWidth,
-              ScreenHeight |
-            Format-List
-
-
-      # =========================================================
-      # SUNSHINE INSTALL
-      # =========================================================
-      - name: Install Sunshine
-        shell: powershell
-        run: |
-          $version = "2026.516.143833"
-
-          $url = "https://github.com/LizardByte/Sunshine/releases/download/v$version/Sunshine-Windows-AMD64-installer.exe"
-
-          $file = "$env:TEMP\Sunshine-Installer.exe"
-
-          Write-Host "Downloading Sunshine..."
-
-          Invoke-WebRequest `
-            $url `
-            -OutFile $file
-
-          Start-Process `
-            $file `
-            -ArgumentList "/S" `
-            -Wait
-
-          Remove-Item `
-            $file `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          $sunshine = "C:\Program Files\Sunshine\sunshine.exe"
-
-          if (-not (Test-Path $sunshine)) {
-            Write-Error "Sunshine installation failed."
-            exit 1
-          }
-
-          "SUNSHINE_EXE=$sunshine" >> $env:GITHUB_ENV
-
-          Write-Host "Sunshine installed."
-
-
-      # =========================================================
-      # STOP SUNSHINE BEFORE CONFIG
-      # =========================================================
-      - name: Stop Sunshine before configuration
-        shell: powershell
-        run: |
-          Stop-Service `
-            Sunshine `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Get-Process `
-            sunshine `
-            -ErrorAction SilentlyContinue |
-            Stop-Process `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Start-Sleep -Seconds 3
-
-
-      # =========================================================
-      # SUNSHINE CONFIG
-      # =========================================================
-      - name: Configure Sunshine
-        shell: powershell
-        run: |
-          $dir = "C:\Program Files\Sunshine\config"
-
-          New-Item `
-            -ItemType Directory `
-            -Path $dir `
-            -Force |
-            Out-Null
-
-          $config = "$dir\sunshine.conf"
-
-          @"
-          sunshine_name = GitHub-Moonlight
-          address_family = ipv4
-          bind_address = 0.0.0.0
-          port = 47989
-          origin_web_ui_allowed = wan
-          csrf_allowed_origins = https://$env:TAILSCALE_IP`:47990
-          lan_encryption_mode = 1
-          wan_encryption_mode = 1
-          upnp = disabled
-          max_bitrate = 0
-          minimum_fps_target = 30
-          hevc_mode = 0
-          av1_mode = 0
-          "@ |
-            Set-Content `
-              $config `
-              -Encoding UTF8
-
-          Write-Host "========== SUNSHINE CONFIG =========="
-
-          Get-Content $config
-
-
-      # =========================================================
-      # SUNSHINE USER/PASSWORD
-      # =========================================================
-      - name: Configure Sunshine credentials
-        shell: powershell
-        run: |
-          $bytes = New-Object byte[] 18
-
-          [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-
-          $password = [Convert]::ToBase64String($bytes)
-
-          $password = $password.Replace("+","A")
-          $password = $password.Replace("/","B")
-          $password = $password.Replace("=","C")
-
-          & $env:SUNSHINE_EXE `
-            --creds `
-            moonlight `
-            "$password"
-
-          "SUNSHINE_USER=moonlight" >> $env:GITHUB_ENV
-
-          "SUNSHINE_PASSWORD=$password" >> $env:GITHUB_ENV
-
-
-      # =========================================================
-      # FIREWALL
-      # =========================================================
-      - name: Configure Sunshine firewall
-        shell: powershell
-        run: |
-          netsh advfirewall firewall delete rule `
-            name="Sunshine-Tailscale-TCP" 2>$null
-
-          netsh advfirewall firewall delete rule `
-            name="Sunshine-Tailscale-UDP" 2>$null
-
-          netsh advfirewall firewall add rule `
-            name="Sunshine-Tailscale-TCP" `
-            dir=in `
-            action=allow `
-            protocol=TCP `
-            localport=47984,47989,47990,48010 `
-            profile=any
-
-          netsh advfirewall firewall add rule `
-            name="Sunshine-Tailscale-UDP" `
-            dir=in `
-            action=allow `
-            protocol=UDP `
-            localport=47998,47999,48000,48002 `
-            profile=any
-
-
-      # =========================================================
-      # START SUNSHINE
-      # =========================================================
-      - name: Start Sunshine service
-        shell: powershell
-        run: |
-          $service = Get-Service `
-            Sunshine `
-            -ErrorAction SilentlyContinue
-
-          if (-not $service) {
-            Write-Error "Sunshine service not found."
-            exit 1
-          }
-
-          Set-Service `
-            Sunshine `
-            -StartupType Automatic
-
-          Start-Service `
-            Sunshine `
-            -ErrorAction SilentlyContinue
-
-          Start-Sleep -Seconds 12
-
-          $status = (Get-Service Sunshine).Status
-
-          Write-Host "Sunshine status: $status"
-
-          if ($status -ne "Running") {
-            Write-Error "Sunshine service did not start."
-            exit 1
-          }
-
-
-      # =========================================================
-      # WAIT SUNSHINE WEB
-      # =========================================================
-      - name: Wait for Sunshine Web UI
-        shell: powershell
-        run: |
-          $ready = $false
-
-          for ($i = 0; $i -lt 30; $i++) {
-
-            $test = Test-NetConnection `
-              127.0.0.1 `
-              -Port 47990 `
-              -InformationLevel Quiet
-
-            if ($test) {
-              $ready = $true
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $ready) {
-            Write-Error "Sunshine Web UI did not open on port 47990."
-            exit 1
-          }
-
-          Write-Host "Sunshine Web UI is running."
-
-
-      # =========================================================
-      # VIGEMBUS
-      # =========================================================
-      - name: Try ViGEmBus installation
-        shell: powershell
-        run: |
-          $auth = [Convert]::ToBase64String(
-            [Text.Encoding]::ASCII.GetBytes(
-              "$env:SUNSHINE_USER`:$env:SUNSHINE_PASSWORD"
-            )
-          )
-
-          $headers = @{
-            Authorization = "Basic $auth"
-          }
-
-          try {
-
-            $response = Invoke-WebRequest `
-              "https://127.0.0.1:47990/api/csrf-token" `
-              -Headers $headers `
-              -UseBasicParsing `
-              -SkipCertificateCheck
-
-            $json = $response.Content | ConvertFrom-Json
-
-            if ($json.token) {
-
-              $headers["X-CSRF-Token"] = $json.token
-
-              Invoke-WebRequest `
-                "https://127.0.0.1:47990/api/vigembus/install" `
-                -Method POST `
-                -Headers $headers `
-                -UseBasicParsing `
-                -SkipCertificateCheck
-
-              Write-Host "ViGEmBus installation request sent."
-
-            } else {
-
-              Write-Warning "No CSRF token returned."
-
-            }
-
-          } catch {
-
-            Write-Warning "ViGEmBus automatic installation skipped."
-
-            Write-Warning $_.Exception.Message
-          }
-
-
-      # =========================================================
-      # VERIFY SUNSHINE PORTS
-      # =========================================================
-      - name: Verify Sunshine
-        shell: powershell
-        run: |
-          Write-Host "======================================"
-          Write-Host "SUNSHINE TCP PORTS"
-          Write-Host "======================================"
-
-          Get-NetTCPConnection `
-            -State Listen `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.LocalPort -in 47984,47989,47990,48010
-            } |
-            Format-Table `
-              LocalAddress,
-              LocalPort,
-              State
-
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "SUNSHINE UDP PORTS"
-          Write-Host "======================================"
-
-          Get-NetUDPEndpoint `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.LocalPort -in 47998,47999,48000,48002
-            } |
-            Format-Table `
-              LocalAddress,
-              LocalPort
-
-          Write-Host ""
-          Write-Host "Web UI test:"
-
-          Test-NetConnection `
-            127.0.0.1 `
-            -Port 47990
-
-
-      # =========================================================
-      # CONNECTION INFORMATION
-      # =========================================================
-      - name: Connection information
-        shell: powershell
-        run: |
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "        WINDOWS CLOUD PC READY"
-          Write-Host "================================================"
-
-          Write-Host ""
-          Write-Host "COMPUTER"
-          Write-Host "Name           : $env:COMPUTERNAME"
-          Write-Host "Runner user    : $env:USERNAME"
-
-          Write-Host ""
-          Write-Host "TAILSCALE"
-          Write-Host "IP             : $env:TAILSCALE_IP"
-
-          Write-Host ""
-          Write-Host "RDP"
-          Write-Host "Address        : $env:TAILSCALE_IP`:3389"
-          Write-Host "Username       : RDP"
-          Write-Host "Password       : $env:RDP_PASSWORD"
-
-          Write-Host ""
-          Write-Host "SUNSHINE"
-          Write-Host "Web UI         : https://$env:TAILSCALE_IP`:47990"
-          Write-Host "Username       : $env:SUNSHINE_USER"
-          Write-Host "Password       : $env:SUNSHINE_PASSWORD"
-
-          Write-Host ""
-          Write-Host "MOONLIGHT"
-          Write-Host "PC address     : $env:TAILSCALE_IP"
-
-          Write-Host ""
-          Write-Host "================================================"
-
-
-      # =========================================================
-      # KEEP PC ALIVE
-      # =========================================================
-      - name: Keep PC alive
-        shell: powershell
-        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
-
-            $service = Get-Service `
-              Sunshine `
-              -ErrorAction SilentlyContinue
-
-            if ($service -and $service.Status -ne "Running") {
-
-              Write-Warning "Sunshine stopped. Restarting..."
-
-              Start-Service `
-                Sunshine `
-                -ErrorAction SilentlyContinue
-            }
-
-            Write-Host ""
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Windows PC active"
-            Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-
-            Start-Sleep -Seconds 60
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
