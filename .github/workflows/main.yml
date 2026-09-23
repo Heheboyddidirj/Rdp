@@ -1,4 +1,4 @@
-name: Windows RDP + Tailscale + Backblaze B2 Backup
+name: Windows RDP + Tailscale + Backblaze B2 Auto Backup
 
 on:
   workflow_dispatch:
@@ -9,9 +9,6 @@ permissions:
 jobs:
   rdp:
     runs-on: windows-2022
-
-    # GitHub-hosted runner là máy tạm thời.
-    # 350 phút gần mức tối đa cho job này.
     timeout-minutes: 350
 
     env:
@@ -29,7 +26,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Path $env:RCLONE_DIR -Force | Out-Null
+          New-Item -ItemType Directory `
+            -Path $env:RCLONE_DIR `
+            -Force | Out-Null
 
           $zip = "$env:TEMP\rclone.zip"
 
@@ -48,10 +47,6 @@ jobs:
             -Recurse |
             Select-Object -First 1
 
-          if (-not $exe) {
-            throw "rclone.exe not found"
-          }
-
           Copy-Item `
             $exe.FullName `
             "$env:RCLONE_DIR\rclone.exe" `
@@ -61,7 +56,7 @@ jobs:
 
 
       # ============================================================
-      # 2. Cấu hình Backblaze B2
+      # 2. Cấu hình Backblaze
       # ============================================================
       - name: Configure Backblaze B2
         shell: powershell
@@ -73,24 +68,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not $env:B2_KEY_ID) {
-            throw "B2_KEY_ID is missing"
-          }
-
-          if (-not $env:B2_APPLICATION_KEY) {
-            throw "B2_APPLICATION_KEY is missing"
-          }
-
-          if (-not $env:B2_BUCKET) {
-            throw "B2_BUCKET is missing"
-          }
-
-          if (-not $env:B2_ENDPOINT) {
-            throw "B2_ENDPOINT is missing"
-          }
-
-          New-Item `
-            -ItemType Directory `
+          New-Item -ItemType Directory `
             -Path $env:RCLONE_DIR `
             -Force | Out-Null
 
@@ -101,7 +79,6 @@ jobs:
           access_key_id = $env:B2_KEY_ID
           secret_access_key = $env:B2_APPLICATION_KEY
           endpoint = $env:B2_ENDPOINT
-          region = auto
           acl = private
           "@
 
@@ -110,21 +87,19 @@ jobs:
             -Value $config `
             -Encoding UTF8
 
-          # Chỉ lưu tên bucket/path vào GITHUB_ENV,
-          # không lưu secret.
-          "B2_REMOTE=b2:$env:B2_BUCKET/rdp-profile" |
+          "B2_BUCKET_REMOTE=b2:$env:B2_BUCKET" |
             Out-File `
               -FilePath $env:GITHUB_ENV `
               -Append `
               -Encoding utf8
 
-          Write-Host "Backblaze configuration created."
+          Write-Host "Backblaze configured."
 
 
       # ============================================================
-      # 3. Test kết nối B2
+      # 3. Kiểm tra B2
       # ============================================================
-      - name: Test Backblaze connection
+      - name: Test Backblaze B2
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -132,17 +107,18 @@ jobs:
           Write-Host "Testing Backblaze B2..."
 
           & "$env:RCLONE_DIR\rclone.exe" `
-            lsd "b2:$env:B2_BUCKET"
+            lsf "$env:B2_BUCKET_REMOTE" `
+            --max-depth 1
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Cannot connect to Backblaze B2"
+            throw "Cannot access Backblaze B2."
           }
 
           Write-Host "Backblaze B2 connection OK."
 
 
       # ============================================================
-      # 4. Tạo / cập nhật tài khoản RDP
+      # 4. Tạo tài khoản RDP
       # ============================================================
       - name: Create RDP user
         shell: powershell
@@ -150,10 +126,6 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = "Stop"
-
-          if (-not $env:RDP_PASSWORD) {
-            throw "RDP_PASSWORD is missing"
-          }
 
           $securePassword =
             ConvertTo-SecureString `
@@ -174,15 +146,11 @@ jobs:
               -AccountNeverExpires `
               -PasswordNeverExpires
 
-            Write-Host "Created RDP user."
-
           } else {
 
             Set-LocalUser `
               -Name "RDP" `
               -Password $securePassword
-
-            Write-Host "Updated RDP password."
           }
 
           Add-LocalGroupMember `
@@ -190,17 +158,16 @@ jobs:
             -Member "RDP" `
             -ErrorAction SilentlyContinue
 
-          # Cho phép admin nếu cần cài phần mềm / thao tác hệ thống.
           Add-LocalGroupMember `
             -Group "Administrators" `
             -Member "RDP" `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP account ready."
+          Write-Host "RDP user ready."
 
 
       # ============================================================
-      # 5. Bật Windows RDP
+      # 5. Bật RDP
       # ============================================================
       - name: Configure Windows RDP
         shell: powershell
@@ -228,66 +195,61 @@ jobs:
 
 
       # ============================================================
-      # 6. RESTORE profile từ Backblaze
+      # 6. Restore dữ liệu cũ
       # ============================================================
       - name: Restore RDP profile
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item `
-            -ItemType Directory `
+          New-Item -ItemType Directory `
             -Path $env:PROFILE `
             -Force | Out-Null
+
+          $remote = "$env:B2_BUCKET_REMOTE/rdp-profile"
 
           Write-Host "Checking previous backup..."
 
           & "$env:RCLONE_DIR\rclone.exe" `
-            lsf "$env:B2_REMOTE" `
+            lsf "$remote" `
             --max-depth 1
 
           if ($LASTEXITCODE -eq 0) {
 
-            Write-Host ""
-            Write-Host "======================================"
-            Write-Host " Previous RDP backup detected"
-            Write-Host " Restoring..."
-            Write-Host "======================================"
+            Write-Host "Previous backup found."
+            Write-Host "Restoring..."
 
             & "$env:RCLONE_DIR\rclone.exe" `
               sync `
-              "$env:B2_REMOTE" `
+              "$remote" `
               "$env:PROFILE" `
               --transfers 8 `
               --checkers 16 `
-              --multi-thread-streams 4 `
               --retries 5 `
               --low-level-retries 10 `
               --stats 30s `
               --progress
 
             if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Some files could not be restored."
-            } else {
-              Write-Host "Restore completed."
+              throw "Restore failed."
             }
+
+            Write-Host "Restore completed."
 
           } else {
 
             Write-Host "No previous backup found."
-            Write-Host "Starting with a new RDP profile."
+            Write-Host "Starting new profile."
           }
 
 
       # ============================================================
       # 7. Sửa quyền profile
       # ============================================================
-      - name: Fix RDP profile permissions
+      - name: Fix profile permissions
         shell: powershell
         run: |
           if (Test-Path $env:PROFILE) {
-
-            Write-Host "Fixing RDP profile permissions..."
 
             icacls `
               $env:PROFILE `
@@ -295,7 +257,6 @@ jobs:
               /grant "RDP:(OI)(CI)F" `
               /T `
               /C
-
           }
 
 
@@ -323,8 +284,6 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          Write-Host "Tailscale installed."
-
 
       # ============================================================
       # 9. Kết nối Tailscale
@@ -336,10 +295,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not $env:TAILSCALE_AUTHKEY) {
-            throw "TAILSCALE_AUTHKEY is missing"
-          }
-
           $tailscale =
             "$env:ProgramFiles\Tailscale\tailscale.exe"
 
@@ -349,11 +304,12 @@ jobs:
 
           Start-Sleep -Seconds 5
 
-          $ip = & $tailscale ip -4 |
+          $ip =
+            & $tailscale ip -4 |
             Select-Object -First 1
 
           if (-not $ip) {
-            throw "Tailscale IPv4 address was not assigned."
+            throw "Tailscale IP was not assigned."
           }
 
           "TAILSCALE_IP=$ip" |
@@ -364,177 +320,169 @@ jobs:
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host "          RDP CONNECTION"
-          Write-Host "======================================"
-          Write-Host "Address : $ip"
-          Write-Host "User    : RDP"
-          Write-Host "Password: GitHub Secret RDP_PASSWORD"
+          Write-Host " RDP READY"
+          Write-Host " Address : $ip"
+          Write-Host " Username: RDP"
           Write-Host "======================================"
           Write-Host ""
 
 
       # ============================================================
-      # 10. Hiển thị CPU / RAM / GPU
+      # 10. Auto backup mỗi 5 phút
       # ============================================================
-      - name: Show hardware
+      - name: Start automatic 5-minute backup
         shell: powershell
         run: |
-          Write-Host "===== CPU ====="
+          $ErrorActionPreference = "Continue"
 
-          Get-CimInstance Win32_Processor |
-            Select-Object `
-              Name,
-              NumberOfCores,
-              NumberOfLogicalProcessors
+          $scriptPath = "C:\rclone\auto-backup.ps1"
 
-          Write-Host ""
-          Write-Host "===== RAM ====="
+          @'
+          $ErrorActionPreference = "Continue"
 
-          $ram =
-            Get-CimInstance Win32_ComputerSystem
+          $profile = "C:\Users\RDP"
+          $rclone = "C:\rclone\rclone.exe"
+          $remote = "$env:B2_BUCKET_REMOTE/rdp-profile"
 
-          Write-Host (
-            "RAM: {0:N2} GB" -f
-            ($ram.TotalPhysicalMemory / 1GB)
-          )
+          while ($true) {
 
-          Write-Host ""
-          Write-Host "===== GPU ====="
+              Write-Host ""
+              Write-Host "======================================"
+              Write-Host " AUTO BACKUP START"
+              Write-Host "$(Get-Date)"
+              Write-Host "======================================"
 
-          Get-CimInstance Win32_VideoController |
-            Select-Object `
-              Name,
-              DriverVersion,
-              AdapterRAM
+              if (Test-Path $profile) {
+
+                  & $rclone sync `
+                    $profile `
+                    $remote `
+                    --transfers 8 `
+                    --checkers 16 `
+                    --retries 3 `
+                    --low-level-retries 5 `
+                    --stats 30s `
+                    --exclude "AppData/Local/Temp/**" `
+                    --exclude "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**" `
+                    --exclude "AppData/Local/Google/Chrome/User Data/Default/Cache/**"
+
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "AUTO BACKUP SUCCESS"
+                  } else {
+                      Write-Host "AUTO BACKUP ERROR - will retry."
+                  }
+
+              } else {
+
+                  Write-Host "Profile does not exist yet."
+              }
+
+              Write-Host "Next backup in 5 minutes."
+
+              Start-Sleep -Seconds 300
+          }
+          '@ |
+            Set-Content `
+              -Path $scriptPath `
+              -Encoding UTF8
+
+          $env:B2_BUCKET_REMOTE |
+            Out-File `
+              -FilePath "C:\rclone\b2remote.txt" `
+              -Encoding utf8
+
+          Start-Process `
+            powershell.exe `
+            -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" `
+            -WindowStyle Hidden
+
+          Write-Host "Automatic 5-minute backup started."
 
 
       # ============================================================
-      # 11. Download Downloads.bat
-      # ============================================================
-      - name: Install Downloads.bat
-        shell: powershell
-        run: |
-          $startup =
-            "$env:PROFILE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-
-          New-Item `
-            -ItemType Directory `
-            -Path $startup `
-            -Force | Out-Null
-
-          $url =
-            "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-
-          $target =
-            "$startup\Downloads.bat"
-
-          Invoke-WebRequest `
-            -Uri $url `
-            -OutFile $target
-
-          Write-Host "Downloads.bat installed."
-
-
-      # ============================================================
-      # 12. Giữ runner online cho RDP
+      # 11. Giữ RDP hoạt động
       # ============================================================
       - name: Keep RDP alive
         shell: powershell
         run: |
-          # Dành khoảng 20 phút cuối cho backup.
-          $end =
-            (Get-Date).AddMinutes(330)
+          $end = (Get-Date).AddMinutes(330)
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host " RDP SERVER IS READY"
-          Write-Host " Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host " User: RDP"
+          Write-Host " RDP SERVER ACTIVE"
+          Write-Host " IP: $env:TAILSCALE_IP"
+          Write-Host " Backup: EVERY 5 MINUTES"
           Write-Host "======================================"
           Write-Host ""
 
           while ((Get-Date) -lt $end) {
 
-            Write-Host (
-              "[{0}] RDP ACTIVE" -f (Get-Date)
-            )
+            Write-Host "[$(Get-Date)] RDP ACTIVE - Auto backup running"
 
             Start-Sleep -Seconds 300
           }
 
-          Write-Host "RDP time finished."
+          Write-Host "RDP session time finished."
 
 
       # ============================================================
-      # 13. BACKUP toàn bộ C:\Users\RDP
+      # 12. Backup cuối cùng
       # ============================================================
-      - name: Backup RDP profile to Backblaze
+      - name: Final backup
         if: always()
         shell: powershell
         run: |
           Write-Host ""
           Write-Host "======================================"
-          Write-Host " BACKING UP RDP PROFILE"
+          Write-Host " FINAL BACKUP"
           Write-Host "======================================"
 
-          if (-not (Test-Path $env:PROFILE)) {
+          $remote = "$env:B2_BUCKET_REMOTE/rdp-profile"
 
-            Write-Warning `
-              "RDP profile does not exist."
+          if (Test-Path $env:PROFILE) {
 
-            exit 0
-          }
+            & "$env:RCLONE_DIR\rclone.exe" `
+              sync `
+              "$env:PROFILE" `
+              "$remote" `
+              --transfers 8 `
+              --checkers 16 `
+              --retries 10 `
+              --low-level-retries 20 `
+              --retries-sleep 5s `
+              --stats 30s `
+              --progress `
+              --exclude "AppData/Local/Temp/**" `
+              --exclude "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**" `
+              --exclude "AppData/Local/Google/Chrome/User Data/Default/Cache/**"
 
-          # Loại bỏ một số cache/temp không cần thiết
-          # để giảm dung lượng backup.
-          $exclude = @(
-            "--exclude", "AppData/Local/Temp/**",
-            "--exclude", "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**",
-            "--exclude", "AppData/Local/Google/Chrome/User Data/Default/Cache/**"
-          )
+            if ($LASTEXITCODE -eq 0) {
 
-          & "$env:RCLONE_DIR\rclone.exe" `
-            sync `
-            "$env:PROFILE" `
-            "$env:B2_REMOTE" `
-            --transfers 8 `
-            --checkers 16 `
-            --multi-thread-streams 4 `
-            --retries 10 `
-            --low-level-retries 20 `
-            --retries-sleep 5s `
-            --fast-list `
-            --stats 30s `
-            --progress `
-            @exclude
+              Write-Host ""
+              Write-Host "======================================"
+              Write-Host " FINAL BACKUP SUCCESS"
+              Write-Host "======================================"
 
-          if ($LASTEXITCODE -ne 0) {
+            } else {
 
-            Write-Warning `
-              "Backup finished with some errors."
+              Write-Warning "Final backup encountered errors."
+            }
 
           } else {
 
-            Write-Host ""
-            Write-Host "======================================"
-            Write-Host " BACKUP COMPLETED SUCCESSFULLY"
-            Write-Host "======================================"
+            Write-Warning "RDP profile does not exist."
           }
 
 
       # ============================================================
-      # 14. Hiển thị thông tin backup
+      # 13. Kiểm tra backup
       # ============================================================
       - name: Verify backup
         if: always()
         shell: powershell
         run: |
           Write-Host ""
-          Write-Host "===== BACKUP CONTENT ====="
+          Write-Host "===== B2 BACKUP SIZE ====="
 
           & "$env:RCLONE_DIR\rclone.exe" `
-            size "$env:B2_REMOTE"
-
-          Write-Host ""
-          Write-Host "RDP profile backup location:"
-          Write-Host "$env:B2_REMOTE"
+            size "$env:B2_BUCKET_REMOTE/rdp-profile"
