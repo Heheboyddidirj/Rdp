@@ -1,35 +1,232 @@
-name: GCP GPU PC - RDP + Tailscale
+name: Windows RDP + Tailscale + Full Profile Backup
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  gpu-pc:
-    runs-on: self-hosted
-    timeout-minutes: 360
+  secure-rdp:
+    runs-on: windows-2022
+
+    # Phải chừa thời gian để backup trước khi GitHub timeout.
+    timeout-minutes: 350
+
+    env:
+      PROFILE: C:\Users\RDP
+      BACKUP_DIR: C:\RDP_BACKUP
+      RCLONE: C:\rclone\rclone.exe
 
     steps:
 
-      - name: Check GPU
+      # ==========================================================
+      # 1. INSTALL RCLONE
+      # ==========================================================
+      - name: Install rclone
         shell: powershell
         run: |
-          Write-Host "===== GPU ====="
+          New-Item -ItemType Directory `
+            -Path "C:\rclone" `
+            -Force | Out-Null
 
-          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
-              nvidia-smi
+          $zip = "$env:TEMP\rclone.zip"
+
+          Invoke-WebRequest `
+            -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" `
+            -OutFile $zip
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath "$env:TEMP\rclone" `
+            -Force
+
+          $exe = Get-ChildItem `
+            "$env:TEMP\rclone" `
+            -Filter "rclone.exe" `
+            -Recurse |
+            Select-Object -First 1
+
+          Copy-Item `
+            $exe.FullName `
+            $env:RCLONE `
+            -Force
+
+          & $env:RCLONE version
+
+      # ==========================================================
+      # 2. CREATE RCLONE S3 CONFIG
+      # ==========================================================
+      - name: Configure private storage
+        shell: powershell
+        env:
+          STORAGE_ACCESS_KEY: ${{ secrets.STORAGE_ACCESS_KEY }}
+          STORAGE_SECRET_KEY: ${{ secrets.STORAGE_SECRET_KEY }}
+          STORAGE_ENDPOINT: ${{ secrets.STORAGE_ENDPOINT }}
+          STORAGE_BUCKET: ${{ secrets.STORAGE_BUCKET }}
+        run: |
+
+          New-Item `
+            -ItemType Directory `
+            -Path "C:\rclone-config" `
+            -Force | Out-Null
+
+          $config = @"
+          [backup]
+          type = s3
+          provider = Other
+          access_key_id = $env:STORAGE_ACCESS_KEY
+          secret_access_key = $env:STORAGE_SECRET_KEY
+          endpoint = $env:STORAGE_ENDPOINT
+          acl = private
+          "@
+
+          Set-Content `
+            -Path "C:\rclone-config\rclone.conf" `
+            -Value $config `
+            -Encoding UTF8
+
+          "STORAGE_REMOTE=backup:$env:STORAGE_BUCKET/rdp-profile" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append `
+              -Encoding utf8
+
+      # ==========================================================
+      # 3. CREATE RDP USER
+      # ==========================================================
+      - name: Create RDP user
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $user = Get-LocalUser `
+            -Name "RDP" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $user) {
+
+            New-LocalUser `
+              -Name "RDP" `
+              -Password $securePassword `
+              -AccountNeverExpires
+
           }
           else {
-              Write-Error "NVIDIA driver / nvidia-smi not found."
-              exit 1
+
+            Set-LocalUser `
+              -Name "RDP" `
+              -Password $securePassword
           }
 
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP user ready."
+
+      # ==========================================================
+      # 4. ENABLE RDP
+      # ==========================================================
+      - name: Configure RDP
+        shell: powershell
+        run: |
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Restart-Service `
+            -Name TermService `
+            -Force
+
+      # ==========================================================
+      # 5. RESTORE PREVIOUS PROFILE
+      # ==========================================================
+      - name: Restore RDP profile
+        shell: powershell
+        env:
+          RCLONE_CONFIG: C:\rclone-config\rclone.conf
+        run: |
+
+          Write-Host "Checking remote backup..."
+
+          New-Item `
+            -ItemType Directory `
+            -Path $env:PROFILE `
+            -Force | Out-Null
+
+          $check = & $env:RCLONE lsd `
+            "$env:STORAGE_REMOTE" `
+            2>&1
+
+          if ($LASTEXITCODE -eq 0) {
+
+            Write-Host "Previous backup found."
+            Write-Host "Restoring RDP profile..."
+
+            & $env:RCLONE sync `
+              "$env:STORAGE_REMOTE" `
+              "$env:PROFILE" `
+              --transfers 8 `
+              --checkers 16 `
+              --multi-thread-streams 4 `
+              --retries 5 `
+              --low-level-retries 10 `
+              --progress
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Some files could not be restored."
+            }
+
+          }
+          else {
+
+            Write-Host "No previous backup found."
+            Write-Host "Using fresh RDP profile."
+
+          }
+
+      # ==========================================================
+      # 6. FIX PROFILE PERMISSIONS
+      # ==========================================================
+      - name: Fix RDP profile permissions
+        shell: powershell
+        run: |
+
+          if (Test-Path $env:PROFILE) {
+
+            icacls $env:PROFILE `
+              /inheritance:e `
+              /grant "RDP:(OI)(CI)F" `
+              /T `
+              /C
+
+          }
+
+      # ==========================================================
+      # 7. INSTALL TAILSCALE
+      # ==========================================================
       - name: Install Tailscale
         shell: powershell
         run: |
+
           $installer = "$env:TEMP\tailscale.msi"
 
           Invoke-WebRequest `
-            "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
             -OutFile $installer
 
           Start-Process `
@@ -37,107 +234,158 @@ jobs:
             -ArgumentList "/i `"$installer`" /quiet /norestart" `
             -Wait
 
-          Remove-Item $installer -Force
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
 
+      # ==========================================================
+      # 8. CONNECT TAILSCALE
+      # ==========================================================
       - name: Connect Tailscale
         shell: powershell
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              throw "Missing TAILSCALE_AUTH_KEY"
-          }
 
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-
-          & $ts up `
-            --authkey="$env:TAILSCALE_AUTH_KEY" `
-            --hostname="gcp-gpu-$env:GITHUB_RUN_ID" `
-            --accept-dns=false
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" `
+            --hostname="gh-rdp-$env:GITHUB_RUN_ID"
 
           Start-Sleep -Seconds 5
 
-          $ip = & $ts ip -4 |
-            Where-Object { $_ -match '^100\.' } |
-            Select-Object -First 1
+          $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
 
-          if (!$ip) {
-              throw "Tailscale IP not found."
+          if (-not $ip) {
+            Write-Error "Tailscale IP was not assigned."
+            exit 1
           }
 
-          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "             RDP ACCESS"
+          Write-Host "======================================"
+          Write-Host "Tailscale IP : $ip"
+          Write-Host "Username     : RDP"
+          Write-Host "======================================"
+          Write-Host ""
 
-      - name: Enable RDP
+          "TAILSCALE_IP=$ip" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Append
+
+      # ==========================================================
+      # 9. HARDWARE
+      # ==========================================================
+      - name: Show hardware
         shell: powershell
         run: |
-          Set-ItemProperty `
-            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name fDenyTSConnections `
-            -Value 0
 
-          Set-Service `
-            TermService `
-            -StartupType Automatic
+          Write-Host "========== CPU =========="
 
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop"
+          Get-CimInstance Win32_Processor |
+            Select-Object `
+              Name,
+              NumberOfCores,
+              NumberOfLogicalProcessors
 
-          Restart-Service `
-            TermService `
-            -Force
+          Write-Host "========== RAM =========="
 
-      - name: Verify RDP
+          $ram = Get-CimInstance Win32_ComputerSystem
+
+          Write-Host (
+            "RAM: {0:N2} GB" -f
+            ($ram.TotalPhysicalMemory / 1GB)
+          )
+
+          Write-Host "========== GPU =========="
+
+          Get-CimInstance Win32_VideoController |
+            Select-Object `
+              Name,
+              DriverVersion,
+              AdapterRAM
+
+      # ==========================================================
+      # 10. DOWNLOAD Downloads.bat
+      # ==========================================================
+      - name: Install Downloads.bat
         shell: powershell
         run: |
-          Write-Host "===== TAILSCALE IP ====="
-          Write-Host $env:TAILSCALE_IP
 
-          Write-Host ""
-          Write-Host "===== GPU ====="
-          nvidia-smi
+          $startup = `
+            "$env:PROFILE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
 
-          Write-Host ""
-          Write-Host "===== RDP ====="
+          New-Item `
+            -ItemType Directory `
+            -Path $startup `
+            -Force | Out-Null
 
-          Test-NetConnection `
-            127.0.0.1 `
-            -Port 3389
+          Invoke-WebRequest `
+            -Uri "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat" `
+            -OutFile "$startup\Downloads.bat"
 
-          Write-Host ""
-          Write-Host "===== TAILSCALE RDP ====="
-
-          Test-NetConnection `
-            $env:TAILSCALE_IP `
-            -Port 3389
-
-      - name: Connection information
+      # ==========================================================
+      # 11. KEEP RDP ALIVE
+      #
+      # 330 minutes = 5h30.
+      # Chừa khoảng 20 phút cho backup.
+      # ==========================================================
+      - name: Keep RDP alive
         shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "          GCP GPU PC READY"
-          Write-Host "=========================================="
 
-          Write-Host ""
-          Write-Host "Tailscale IP:"
-          Write-Host $env:TAILSCALE_IP
+          $end = (Get-Date).AddMinutes(330)
 
-          Write-Host ""
-          Write-Host "RDP address:"
-          Write-Host "$env:TAILSCALE_IP`:3389"
+          while ((Get-Date) -lt $end) {
 
-          Write-Host ""
-          Write-Host "GPU:"
-          nvidia-smi
+            Write-Host "$(Get-Date) - RDP ACTIVE"
 
-          Write-Host ""
-          Write-Host "=========================================="
+            Start-Sleep -Seconds 300
+          }
 
-      - name: Keep runner alive
+          Write-Host "RDP session time finished."
+          Write-Host "Starting backup..."
+
+      # ==========================================================
+      # 12. BACKUP ENTIRE RDP PROFILE
+      # ==========================================================
+      - name: Backup entire RDP profile
+        if: always()
         shell: powershell
+        env:
+          RCLONE_CONFIG: C:\rclone-config\rclone.conf
         run: |
-          while ($true) {
-              Write-Host "[$(Get-Date)] GCP GPU PC running"
-              Write-Host "Tailscale: $env:TAILSCALE_IP"
-              Start-Sleep -Seconds 60
+
+          Write-Host "======================================"
+          Write-Host "BACKING UP C:\Users\RDP"
+          Write-Host "======================================"
+
+          if (-not (Test-Path $env:PROFILE)) {
+            Write-Warning "RDP profile does not exist."
+            exit 0
+          }
+
+          & $env:RCLONE sync `
+            "$env:PROFILE" `
+            "$env:STORAGE_REMOTE" `
+            --transfers 8 `
+            --checkers 16 `
+            --multi-thread-streams 4 `
+            --retries 10 `
+            --low-level-retries 20 `
+            --retries-sleep 5s `
+            --fast-list `
+            --create-empty-src-dirs `
+            --progress
+
+          if ($LASTEXITCODE -ne 0) {
+
+            Write-Warning `
+              "Backup completed with some errors."
+
+          }
+          else {
+
+            Write-Host "Backup completed successfully."
+
           }
