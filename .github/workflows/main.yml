@@ -1,10 +1,7 @@
-name: Persistent Windows RDP + Tailscale + B2
+name: Windows RDP + Tailscale + B2 + Auto App Backup
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   rdp:
@@ -12,26 +9,26 @@ jobs:
     timeout-minutes: 350
 
     env:
-      PROFILE: C:\Users\RDP
-      WORK_DIR: C:\RDP-PERSIST
       RCLONE_DIR: C:\Rclone
       RCLONE_CONFIG: C:\Rclone\rclone.conf
+      WORK_DIR: C:\RDP-PERSIST
+      APPS_FILE: C:\RDP-PERSIST\apps.json
 
     steps:
 
       # ============================================================
-      # 1. PREPARE DIRECTORIES
+      # 1. CREATE WORK DIRECTORIES
       # ============================================================
       - name: Prepare directories
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item -ItemType Directory -Force -Path $env:WORK_DIR | Out-Null
-          New-Item -ItemType Directory -Force -Path $env:RCLONE_DIR | Out-Null
-          New-Item -ItemType Directory -Force -Path $env:PROFILE | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:RCLONE_DIR" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:WORK_DIR" | Out-Null
 
-          Write-Host "Directories prepared."
+          Write-Host "Directories ready."
+
 
       # ============================================================
       # 2. INSTALL RCLONE
@@ -41,15 +38,62 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not (Get-Command rclone.exe -ErrorAction SilentlyContinue)) {
-            choco install rclone -y --no-progress
+          Write-Host "Installing rclone..."
+
+          # Remove broken Chocolatey rclone installations/shims
+          choco uninstall rclone.portable -y --force --no-progress 2>$null
+          choco uninstall rclone -y --force --no-progress 2>$null
+
+          # Clean old files
+          Remove-Item "C:\Rclone\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+          # Install rclone
+          choco install rclone -y --no-progress
+
+          Start-Sleep -Seconds 5
+
+          # Find actual rclone.exe
+          $possible = @(
+            "C:\ProgramData\chocolatey\bin\rclone.exe",
+            "C:\ProgramData\chocolatey\lib\rclone\tools\rclone.exe",
+            "C:\ProgramData\chocolatey\lib\rclone.portable\tools\rclone.exe"
+          )
+
+          $found = $null
+
+          foreach ($p in $possible) {
+            if (Test-Path $p) {
+              $found = $p
+              break
+            }
           }
 
-          $rclone = (Get-Command rclone.exe -ErrorAction Stop).Source
+          if (-not $found) {
+            $found = (Get-ChildItem `
+              "C:\ProgramData\chocolatey\lib" `
+              -Filter "rclone.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName)
+          }
 
-          Copy-Item $rclone "$env:RCLONE_DIR\rclone.exe" -Force
+          if (-not $found) {
+            throw "Could not find rclone.exe"
+          }
+
+          Write-Host "Found rclone at:"
+          Write-Host $found
+
+          Copy-Item $found "$env:RCLONE_DIR\rclone.exe" -Force
 
           & "$env:RCLONE_DIR\rclone.exe" version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "rclone test failed"
+          }
+
+          Write-Host "rclone installed successfully."
+
 
       # ============================================================
       # 3. CONFIGURE BACKBLAZE B2
@@ -64,62 +108,120 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:B2_KEY_ID)) {
-            throw "B2_KEY_ID is missing."
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "Configuring Backblaze B2..."
+
+          & $rclone config create b2remote s3 `
+            provider Other `
+            access_key_id "$env:B2_KEY_ID" `
+            secret_access_key "$env:B2_APPLICATION_KEY" `
+            endpoint "$env:B2_ENDPOINT" `
+            --config "$env:RCLONE_CONFIG"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create rclone B2 configuration"
           }
-
-          if ([string]::IsNullOrWhiteSpace($env:B2_APPLICATION_KEY)) {
-            throw "B2_APPLICATION_KEY is missing."
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:B2_BUCKET)) {
-            throw "B2_BUCKET is missing."
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:B2_ENDPOINT)) {
-            throw "B2_ENDPOINT is missing."
-          }
-
-          $config = @"
-          [b2]
-          type = s3
-          provider = Other
-          access_key_id = $env:B2_KEY_ID
-          secret_access_key = $env:B2_APPLICATION_KEY
-          endpoint = $env:B2_ENDPOINT
-          acl = private
-          "@
-
-          Set-Content `
-            -Path $env:RCLONE_CONFIG `
-            -Value $config `
-            -Encoding UTF8
-
-          "B2_REMOTE=b2:$env:B2_BUCKET" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
           Write-Host "B2 configuration created."
+
 
       # ============================================================
       # 4. TEST B2
       # ============================================================
       - name: Test Backblaze B2
         shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          & "$env:RCLONE_DIR\rclone.exe" `
-            lsd "$env:B2_REMOTE" `
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "Testing B2..."
+
+          & $rclone lsd `
+            "b2remote:$env:B2_BUCKET" `
             --config "$env:RCLONE_CONFIG"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Backblaze B2 connection failed."
+            throw "B2 connection failed"
           }
 
           Write-Host "B2 connection OK."
 
+
       # ============================================================
-      # 5. CREATE RDP USER
+      # 5. RESTORE PREVIOUS APP LIST
+      # ============================================================
+      - name: Restore previous app list
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+          $appsFile = "$env:APPS_FILE"
+
+          $remote = "b2remote:$env:B2_BUCKET/apps/apps.json"
+
+          Write-Host "Checking for previous app backup..."
+
+          & $rclone copyto `
+            "$remote" `
+            "$appsFile" `
+            --config "$env:RCLONE_CONFIG" `
+            --retries 5 `
+            --low-level-retries 10
+
+          if (Test-Path $appsFile) {
+            Write-Host "Previous app list restored:"
+            Get-Item $appsFile | Format-List Name,Length,LastWriteTime
+          }
+          else {
+            Write-Host "No previous app backup found."
+          }
+
+
+      # ============================================================
+      # 6. RESTORE / INSTALL APPS
+      # ============================================================
+      - name: Restore installed applications
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $appsFile = "$env:APPS_FILE"
+
+          if (-not (Test-Path $appsFile)) {
+            Write-Host "No apps.json available. Skipping app restore."
+            exit 0
+          }
+
+          Write-Host "Starting application restore..."
+
+          winget import `
+            --import-file "$appsFile" `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --ignore-unavailable `
+            --disable-interactivity
+
+          $code = $LASTEXITCODE
+
+          Write-Host "winget import exit code: $code"
+
+          if ($code -ne 0) {
+            Write-Warning "Some applications may not have been restored."
+            Write-Warning "This does not stop the RDP session."
+          }
+
+          Write-Host "Application restore finished."
+
+
+      # ============================================================
+      # 7. CREATE RDP USER
       # ============================================================
       - name: Create RDP user
         shell: powershell
@@ -128,86 +230,55 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "RDP_PASSWORD secret is missing."
-          }
+          $username = "RDP"
 
           $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
+            "$env:RDP_PASSWORD" `
             -AsPlainText `
             -Force
 
-          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
           if ($existing) {
+            Write-Host "RDP user already exists."
+
             Set-LocalUser `
-              -Name "RDP" `
-              -Password $securePassword `
-              -PasswordNeverExpires $true `
-              -UserMayNotChangePassword $true
+              -Name $username `
+              -Password $securePassword
           }
           else {
             New-LocalUser `
-              -Name "RDP" `
+              -Name $username `
               -Password $securePassword `
               -PasswordNeverExpires `
-              -UserMayNotChangePassword `
-              -AccountNeverExpires
+              -AccountNeverExpires `
+              -UserMayNotChangePassword
+
+            Write-Host "RDP user created."
           }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member "RDP" `
+            -Member $username `
             -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member "RDP" `
+            -Member $username `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user ready."
+          Write-Host "RDP permissions configured."
+
 
       # ============================================================
-      # 6. INITIALIZE WINDOWS PROFILE PATH
+      # 8. ENABLE WINDOWS RDP
       # ============================================================
-      - name: Initialize RDP profile
+      - name: Enable Remote Desktop
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
-          $user = Get-LocalUser -Name "RDP"
-
-          $sid = $user.SID.Value
-
-          $profileKey = `
-            "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-
-          New-Item -Path $profileKey -Force | Out-Null
-
-          Set-ItemProperty `
-            -Path $profileKey `
-            -Name "ProfileImagePath" `
-            -Value $env:PROFILE
-
-          Set-ItemProperty `
-            -Path $profileKey `
-            -Name "Flags" `
-            -Value 0
-
-          New-Item -ItemType Directory `
-            -Force `
-            -Path $env:PROFILE | Out-Null
-
-          Write-Host "Profile SID: $sid"
-          Write-Host "Profile path: $env:PROFILE"
-
-      # ============================================================
-      # 7. ENABLE RDP
-      # ============================================================
-      - name: Configure Windows RDP
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "Enabling Remote Desktop..."
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -217,202 +288,34 @@ jobs:
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
             -Name "UserAuthentication" `
-            -Value 0
+            -Value 1
 
           Enable-NetFirewallRule `
             -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
-          Restart-Service TermService -Force
-
           Write-Host "RDP enabled."
 
-      # ============================================================
-      # 8. RESTORE PROFILE FROM B2
-      # ============================================================
-      - name: Restore RDP profile
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $remote = "$env:B2_REMOTE/rdp-profile"
-
-          Write-Host "Checking previous profile backup..."
-
-          & "$env:RCLONE_DIR\rclone.exe" `
-            lsf "$remote" `
-            --config "$env:RCLONE_CONFIG" `
-            --max-depth 1
-
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "No previous profile backup found."
-          }
-          else {
-            Write-Host "Previous profile detected."
-            Write-Host "Restoring profile..."
-
-            & "$env:RCLONE_DIR\rclone.exe" copy `
-              "$remote" `
-              "$env:PROFILE" `
-              --config "$env:RCLONE_CONFIG" `
-              --transfers 8 `
-              --checkers 16 `
-              --retries 5 `
-              --low-level-retries 10 `
-              --create-empty-src-dirs `
-              --stats 30s
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Some profile files could not be restored."
-            }
-            else {
-              Write-Host "Profile restore completed."
-            }
-          }
 
       # ============================================================
-      # 9. RESTORE PROGRAMDATA
-      # ============================================================
-      - name: Restore ProgramData
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $remote = "$env:B2_REMOTE/programdata"
-
-          Write-Host "Checking ProgramData backup..."
-
-          & "$env:RCLONE_DIR\rclone.exe" lsf `
-            "$remote" `
-            --config "$env:RCLONE_CONFIG" `
-            --max-depth 1
-
-          if ($LASTEXITCODE -eq 0) {
-
-            Write-Host "Restoring ProgramData..."
-
-            & "$env:RCLONE_DIR\rclone.exe" copy `
-              "$remote" `
-              "C:\ProgramData" `
-              --config "$env:RCLONE_CONFIG" `
-              --transfers 8 `
-              --checkers 16 `
-              --retries 3 `
-              --low-level-retries 5 `
-              --exclude "Microsoft/Windows Defender/**" `
-              --exclude "Microsoft/Windows/WindowsUpdate/**" `
-              --stats 30s
-          }
-          else {
-            Write-Host "No ProgramData backup found."
-          }
-
-      # ============================================================
-      # 10. FIX PROFILE PERMISSIONS
-      # ============================================================
-      - name: Fix RDP profile permissions
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          if (Test-Path $env:PROFILE) {
-
-            Write-Host "Fixing RDP profile permissions..."
-
-            $username = "$env:COMPUTERNAME\RDP"
-
-            icacls $env:PROFILE `
-              /grant "${username}:(OI)(CI)F" `
-              /T `
-              /C
-
-            icacls $env:PROFILE `
-              /inheritance:e `
-              /T `
-              /C
-
-            Write-Host "Permissions updated."
-          }
-
-      # ============================================================
-      # 11. RESTORE APPLICATION LIST
-      # ============================================================
-      - name: Restore application list
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $appsFile = "$env:WORK_DIR\apps.json"
-
-          & "$env:RCLONE_DIR\rclone.exe" copyto `
-            "$env:B2_REMOTE/system/apps.json" `
-            "$appsFile" `
-            --config "$env:RCLONE_CONFIG"
-
-          if (Test-Path $appsFile) {
-
-            Write-Host "Application list found."
-
-            Write-Host "Installing previous applications..."
-
-            winget import `
-              --import-file "$appsFile" `
-              --accept-source-agreements `
-              --accept-package-agreements `
-              --ignore-unavailable
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Warning "Some applications could not be restored."
-            }
-          }
-          else {
-            Write-Host "No previous application list found."
-          }
-
-      # ============================================================
-      # 12. SAVE CURRENT APPLICATION LIST
-      # ============================================================
-      - name: Export installed applications
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $appsFile = "$env:WORK_DIR\apps.json"
-
-          winget export `
-            --output "$appsFile" `
-            --include-unknown
-
-          if (Test-Path $appsFile) {
-
-            Write-Host "Uploading application list..."
-
-            & "$env:RCLONE_DIR\rclone.exe" copyto `
-              "$appsFile" `
-              "$env:B2_REMOTE/system/apps.json" `
-              --config "$env:RCLONE_CONFIG"
-          }
-
-      # ============================================================
-      # 13. INSTALL TAILSCALE
+      # 9. INSTALL TAILSCALE
       # ============================================================
       - name: Install Tailscale
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
-          if (-not (Get-Command tailscale.exe -ErrorAction SilentlyContinue)) {
-            winget install `
-              --id Tailscale.Tailscale `
-              --silent `
-              --accept-package-agreements `
-              --accept-source-agreements
-          }
+          Write-Host "Installing Tailscale..."
 
-          Write-Host "Tailscale installed."
+          choco install tailscale -y --no-progress
+
+          Start-Sleep -Seconds 10
+
+          Write-Host "Tailscale installation finished."
+
 
       # ============================================================
-      # 14. CONNECT TAILSCALE
+      # 10. CONNECT TAILSCALE
       # ============================================================
       - name: Connect Tailscale
         shell: powershell
@@ -421,278 +324,243 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            throw "TAILSCALE_AUTHKEY secret is missing."
+          Write-Host "Connecting Tailscale..."
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            $tailscale = "C:\Program Files\Tailscale IPN\tailscale.exe"
           }
 
-          tailscale up `
+          if (-not (Test-Path $tailscale)) {
+            $tailscale = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
+          }
+
+          if (-not $tailscale) {
+            throw "tailscale.exe not found"
+          }
+
+          & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp"
 
           Start-Sleep -Seconds 10
 
-          tailscale status
+          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "TAILSCALE STATUS"
+          Write-Host "=============================="
 
-          $ip = tailscale ip -4
+          & $tailscale status
 
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "RDP ADDRESS:"
-          Write-Host "$ip"
-          Write-Host "=========================================="
-          Write-Host ""
+          Write-Host "=============================="
+          Write-Host "TAILSCALE IP"
+          Write-Host "=============================="
+
+          & $tailscale ip -4
+
 
       # ============================================================
-      # 15. CREATE FIRST-LOGIN RESTORE SCRIPT
+      # 11. AUTO BACKUP APPS EVERY 5 MINUTES
       # ============================================================
-      - name: Create first login restore
+      - name: Keep RDP alive + Auto Backup Applications
         shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $startup = "$env:PROFILE\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $startup | Out-Null
-
-          $script = "$env:WORK_DIR\first-login.ps1"
-
-          @'
-          $ErrorActionPreference = "Continue"
-
-          $marker = "$env:USERPROFILE\.b2-restored"
-
-          if (Test-Path $marker) {
-              exit 0
-          }
-
-          $rclone = "C:\Rclone\rclone.exe"
-          $config = "C:\Rclone\rclone.conf"
-          $remote = "B2REMOTE_PLACEHOLDER/rdp-profile"
-
-          Start-Sleep -Seconds 10
-
-          if (Test-Path $rclone) {
-
-              & $rclone copy `
-                $remote `
-                $env:USERPROFILE `
-                --config $config `
-                --transfers 8 `
-                --checkers 16 `
-                --retries 5 `
-                --low-level-retries 10 `
-                --exclude "AppData/Local/Temp/**" `
-                --exclude "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**" `
-                --exclude "AppData/Local/Google/Chrome/User Data/Default/Cache/**" `
-                --stats 30s
-
-              New-Item `
-                -ItemType File `
-                -Force `
-                -Path $marker | Out-Null
-          }
-          '@.Replace(
-            "B2REMOTE_PLACEHOLDER",
-            $env:B2_REMOTE
-          ) |
-            Set-Content `
-              -Path $script `
-              -Encoding UTF8
-
-          $cmd = "$startup\Restore-B2.cmd"
-
-          "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$script`"" |
-            Set-Content `
-              -Path $cmd `
-              -Encoding ASCII
-
-          Write-Host "First-login restore created."
-
-      # ============================================================
-      # 16. DEBUG PROFILE
-      # ============================================================
-      - name: Check RDP profile
-        shell: powershell
-        run: |
-          Write-Host "========== RDP PROFILE =========="
-
-          Write-Host "Path:"
-          Write-Host $env:PROFILE
-
-          Write-Host ""
-          Write-Host "NTUSER:"
-          Write-Host (Test-Path "$env:PROFILE\NTUSER.DAT")
-
-          Write-Host ""
-          Write-Host "Profile size:"
-
-          $size = (
-            Get-ChildItem `
-              $env:PROFILE `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue |
-            Where-Object {!$_.PSIsContainer} |
-            Measure-Object Length -Sum
-          ).Sum
-
-          "{0:N2} MB" -f ($size / 1MB)
-
-      # ============================================================
-      # 17. KEEP RDP ALIVE + BACKUP EVERY 5 MINUTES
-      # ============================================================
-      - name: Keep RDP alive and backup every 5 minutes
-        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Continue"
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
+          $appsFile = "$env:APPS_FILE"
+          $tempFile = "$env:WORK_DIR\apps.new.json"
 
-          $profileRemote = "$env:B2_REMOTE/rdp-profile"
-          $programDataRemote = "$env:B2_REMOTE/programdata"
+          $remote = "b2remote:$env:B2_BUCKET/apps/apps.json"
 
+          # Keep the machine alive for about 5 hours 35 minutes.
           $endTime = (Get-Date).AddMinutes(335)
 
+          $backupNumber = 0
+
           Write-Host ""
-          Write-Host "=========================================="
+          Write-Host "=============================================="
           Write-Host "RDP IS READY"
-          Write-Host "=========================================="
-
-          $ip = tailscale ip -4
-
-          Write-Host "Address: $ip"
-          Write-Host "Username: RDP"
-          Write-Host "Backup interval: 5 minutes"
-          Write-Host "=========================================="
+          Write-Host "AUTO APP BACKUP: EVERY 5 MINUTES"
+          Write-Host "=============================================="
           Write-Host ""
 
           while ((Get-Date) -lt $endTime) {
 
+            $backupNumber++
+
             Write-Host ""
-            Write-Host "[$(Get-Date)] Starting backup..."
+            Write-Host "=============================================="
+            Write-Host "APP BACKUP #$backupNumber"
+            Write-Host "Time: $(Get-Date)"
+            Write-Host "=============================================="
 
-            if (Test-Path "$env:PROFILE\NTUSER.DAT") {
+            # Remove temporary export
+            Remove-Item `
+              "$tempFile" `
+              -Force `
+              -ErrorAction SilentlyContinue
 
-              & $rclone copy `
-                "$env:PROFILE" `
-                "$profileRemote" `
+            # Export installed applications
+            Write-Host "Exporting installed applications..."
+
+            winget export `
+              --output "$tempFile" `
+              --include-unknown `
+              --accept-source-agreements `
+              --disable-interactivity
+
+            $exportCode = $LASTEXITCODE
+
+            if ($exportCode -eq 0 -and (Test-Path $tempFile)) {
+
+              # Replace the known-good local backup
+              Move-Item `
+                "$tempFile" `
+                "$appsFile" `
+                -Force
+
+              Write-Host "winget export successful."
+
+              # Upload app list to B2
+              Write-Host "Uploading apps.json to Backblaze B2..."
+
+              & $rclone copyto `
+                "$appsFile" `
+                "$remote" `
                 --config "$env:RCLONE_CONFIG" `
-                --transfers 8 `
-                --checkers 16 `
-                --retries 3 `
-                --low-level-retries 5 `
-                --exclude "AppData/Local/Temp/**" `
-                --exclude "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**" `
-                --exclude "AppData/Local/Google/Chrome/User Data/Default/Cache/**" `
-                --stats 30s
+                --retries 5 `
+                --low-level-retries 10 `
+                --stats 10s
 
-              if ($LASTEXITCODE -eq 0) {
-                Write-Host "Profile backup OK."
+              $uploadCode = $LASTEXITCODE
+
+              if ($uploadCode -eq 0) {
+                Write-Host "BACKUP SUCCESSFUL."
               }
               else {
-                Write-Warning "Some profile files could not be backed up."
+                Write-Warning "B2 upload failed. Local apps.json is still preserved."
               }
-
-              & $rclone copy `
-                "C:\ProgramData" `
-                "$programDataRemote" `
-                --config "$env:RCLONE_CONFIG" `
-                --transfers 8 `
-                --checkers 16 `
-                --retries 2 `
-                --low-level-retries 3 `
-                --exclude "Microsoft/Windows Defender/**" `
-                --exclude "Microsoft/Windows/WindowsUpdate/**" `
-                --stats 30s
 
             }
             else {
-              Write-Host "RDP profile has not been initialized yet."
-              Write-Host "Waiting for the first RDP login..."
+
+              Write-Warning "winget export failed."
+              Write-Warning "Exit code: $exportCode"
+              Write-Warning "Previous backup will be kept."
+
+              Remove-Item `
+                "$tempFile" `
+                -Force `
+                -ErrorAction SilentlyContinue
+            }
+
+            # Show current backup
+            if (Test-Path $appsFile) {
+              $fileInfo = Get-Item "$appsFile"
+
+              Write-Host ""
+              Write-Host "Current local backup:"
+              Write-Host "File: $($fileInfo.FullName)"
+              Write-Host "Size: $($fileInfo.Length) bytes"
+              Write-Host "Updated: $($fileInfo.LastWriteTime)"
             }
 
             Write-Host ""
-            Write-Host "Next backup in 5 minutes."
+            Write-Host "Next automatic backup in 5 minutes..."
 
-            Start-Sleep -Seconds 300
+            # Sleep in small intervals so shutdown is clean
+            $sleepUntil = (Get-Date).AddMinutes(5)
+
+            while ((Get-Date) -lt $sleepUntil -and (Get-Date) -lt $endTime) {
+              Start-Sleep -Seconds 10
+            }
           }
 
+          # ========================================================
+          # FINAL BACKUP
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "FINAL APPLICATION BACKUP"
+          Write-Host "=============================================="
+
+          Remove-Item `
+            "$tempFile" `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          winget export `
+            --output "$tempFile" `
+            --include-unknown `
+            --accept-source-agreements `
+            --disable-interactivity
+
+          $finalExportCode = $LASTEXITCODE
+
+          if ($finalExportCode -eq 0 -and (Test-Path $tempFile)) {
+
+            Move-Item `
+              "$tempFile" `
+              "$appsFile" `
+              -Force
+
+            Write-Host "Final export successful."
+
+            & $rclone copyto `
+              "$appsFile" `
+              "$remote" `
+              --config "$env:RCLONE_CONFIG" `
+              --retries 5 `
+              --low-level-retries 10 `
+              --stats 10s
+
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "FINAL BACKUP SUCCESSFUL."
+            }
+            else {
+              Write-Warning "Final B2 upload failed."
+            }
+
+          }
+          else {
+            Write-Warning "Final winget export failed."
+            Write-Warning "Keeping previous successful backup."
+          }
+
+          Write-Host ""
+          Write-Host "RDP session ending."
+
+
       # ============================================================
-      # 18. FINAL BACKUP
+      # 12. VERIFY B2 BACKUP
       # ============================================================
-      - name: Final backup
-        if: always()
+      - name: Verify application backup
         shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Continue"
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
 
-          Write-Host "=========================================="
-          Write-Host "FINAL BACKUP"
-          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "VERIFYING B2 BACKUP"
+          Write-Host "=============================================="
 
-          if (Test-Path $env:PROFILE) {
-
-            & $rclone copy `
-              "$env:PROFILE" `
-              "$env:B2_REMOTE/rdp-profile" `
-              --config "$env:RCLONE_CONFIG" `
-              --transfers 8 `
-              --checkers 16 `
-              --retries 5 `
-              --low-level-retries 10 `
-              --exclude "AppData/Local/Temp/**" `
-              --exclude "AppData/Local/Microsoft/Edge/User Data/Default/Cache/**" `
-              --exclude "AppData/Local/Google/Chrome/User Data/Default/Cache/**" `
-              --stats 30s
-          }
-
-          if (Test-Path "C:\ProgramData") {
-
-            & $rclone copy `
-              "C:\ProgramData" `
-              "$env:B2_REMOTE/programdata" `
-              --config "$env:RCLONE_CONFIG" `
-              --transfers 8 `
-              --checkers 16 `
-              --retries 3 `
-              --low-level-retries 5 `
-              --exclude "Microsoft/Windows Defender/**" `
-              --exclude "Microsoft/Windows/WindowsUpdate/**" `
-              --stats 30s
-          }
-
-          Write-Host "Final backup finished."
-
-      # ============================================================
-      # 19. VERIFY BACKUP
-      # ============================================================
-      - name: Verify backup
-        if: always()
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          Write-Host "========== B2 BACKUP =========="
-
-          & "$env:RCLONE_DIR\rclone.exe" size `
-            "$env:B2_REMOTE/rdp-profile" `
+          & $rclone ls `
+            "b2remote:$env:B2_BUCKET/apps" `
             --config "$env:RCLONE_CONFIG"
 
           Write-Host ""
-          Write-Host "========== APPLICATION BACKUP =========="
-
-          & "$env:RCLONE_DIR\rclone.exe" size `
-            "$env:B2_REMOTE/system" `
-            --config "$env:RCLONE_CONFIG"
+          Write-Host "Backup location:"
+          Write-Host "apps/apps.json"
 
           Write-Host ""
-          Write-Host "========== PROGRAMDATA BACKUP =========="
-
-          & "$env:RCLONE_DIR\rclone.exe" size `
-            "$env:B2_REMOTE/programdata" `
-            --config "$env:RCLONE_CONFIG"
+          Write-Host "Workflow finished."
