@@ -1,4 +1,4 @@
-name: Windows RDP + Tailscale + B2 + Auto App Backup
+name: Windows RDP + Tailscale + B2 + Auto Game Backup V4
 
 on:
   workflow_dispatch:
@@ -6,163 +6,94 @@ on:
 jobs:
   rdp:
     runs-on: windows-2022
-    timeout-minutes: 500
+    timeout-minutes: 350
 
     env:
       RCLONE_DIR: C:\Rclone
       RCLONE_CONFIG: C:\Rclone\rclone.conf
       WORK_DIR: C:\RDP-PERSIST
-      APPS_FILE: C:\RDP-PERSIST\apps.json
+      RDP_USER: RDP
+      RDP_HOME: C:\Users\RDP
+      MANIFEST: C:\RDP-PERSIST\baseline.json
 
     steps:
 
       # ============================================================
-      # 1. PREPARE DIRECTORIES
+      # 1. PREPARE
       # ============================================================
-      - name: Prepare directories
+      - name: Prepare
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
+          New-Item -ItemType Directory -Force `
             -Path "$env:RCLONE_DIR" | Out-Null
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
+          New-Item -ItemType Directory -Force `
             -Path "$env:WORK_DIR" | Out-Null
 
-          Write-Host "Directories prepared."
-
+          Write-Host "RDP USER: $env:RDP_USER"
+          Write-Host "RDP HOME: $env:RDP_HOME"
 
       # ============================================================
-      # 2. INSTALL RCLONE DIRECTLY
-      #    NO CHOCOLATEY
+      # 2. INSTALL RCLONE
       # ============================================================
       - name: Install rclone
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=============================================="
-          Write-Host "INSTALLING RCLONE"
-          Write-Host "=============================================="
+          $zip = "$env:TEMP\rclone.zip"
+          $extract = "$env:TEMP\rclone-extract"
 
-          $rcloneDir = "$env:RCLONE_DIR"
-          $zipFile = "$env:TEMP\rclone.zip"
-          $extractDir = "$env:TEMP\rclone-extract"
-
-          # Clean previous files
-          Remove-Item `
-            "$rcloneDir\*" `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            "$zipFile" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            "$extractDir" `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path "$rcloneDir" | Out-Null
-
-          Write-Host "Downloading official rclone Windows AMD64..."
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
 
           Invoke-WebRequest `
             -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" `
-            -OutFile "$zipFile" `
+            -OutFile $zip `
             -UseBasicParsing
 
-          if (-not (Test-Path "$zipFile")) {
-            throw "rclone download failed"
-          }
-
-          Write-Host "Download completed."
-
-          Write-Host "Extracting rclone..."
-
           Expand-Archive `
-            -Path "$zipFile" `
-            -DestinationPath "$extractDir" `
+            -Path $zip `
+            -DestinationPath $extract `
             -Force
 
-          $rcloneExe = Get-ChildItem `
-            -Path "$extractDir" `
+          $exe = Get-ChildItem `
+            -Path $extract `
             -Filter "rclone.exe" `
             -Recurse `
-            -File `
-            -ErrorAction Stop |
+            -File |
             Select-Object -First 1
 
-          if (-not $rcloneExe) {
-            throw "rclone.exe was not found"
+          if (-not $exe) {
+            throw "rclone.exe not found"
           }
-
-          Write-Host "Real rclone executable:"
-          Write-Host $rcloneExe.FullName
 
           Copy-Item `
-            "$($rcloneExe.FullName)" `
-            "$rcloneDir\rclone.exe" `
+            $exe.FullName `
+            "$env:RCLONE_DIR\rclone.exe" `
             -Force
 
-          if (-not (Test-Path "$rcloneDir\rclone.exe")) {
-            throw "Could not copy rclone.exe"
-          }
-
-          Write-Host ""
-          Write-Host "RCLONE VERSION:"
-          & "$rcloneDir\rclone.exe" version
+          & "$env:RCLONE_DIR\rclone.exe" version
 
           if ($LASTEXITCODE -ne 0) {
-            throw "rclone test failed"
+            throw "rclone failed"
           }
 
-          Write-Host ""
-          Write-Host "rclone installed successfully."
-
-          # Cleanup
-          Remove-Item `
-            "$zipFile" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          Remove-Item `
-            "$extractDir" `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-
       # ============================================================
-      # 3. CONFIGURE BACKBLAZE B2
+      # 3. CONFIGURE B2
       # ============================================================
-      - name: Configure Backblaze B2
+      - name: Configure B2
         shell: powershell
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET: ${{ secrets.B2_BUCKET }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
         run: |
           $ErrorActionPreference = "Stop"
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
-
-          Write-Host "=============================================="
-          Write-Host "CONFIGURING BACKBLAZE B2"
-          Write-Host "=============================================="
 
           Remove-Item `
             "$env:RCLONE_CONFIG" `
@@ -177,139 +108,29 @@ jobs:
             --config "$env:RCLONE_CONFIG"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to create B2 configuration"
+            throw "B2 configuration failed"
           }
-
-          Write-Host "B2 configuration created."
-
 
       # ============================================================
       # 4. TEST B2
       # ============================================================
-      - name: Test Backblaze B2
+      - name: Test B2
         shell: powershell
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          $rclone = "$env:RCLONE_DIR\rclone.exe"
-
-          Write-Host "=============================================="
-          Write-Host "TESTING BACKBLAZE B2"
-          Write-Host "=============================================="
-
-          & $rclone lsd `
+          & "$env:RCLONE_DIR\rclone.exe" lsd `
             "b2remote:$env:B2_BUCKET" `
             --config "$env:RCLONE_CONFIG"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "B2 connection failed"
+            throw "B2 unavailable"
           }
-
-          Write-Host "B2 connection successful."
-
 
       # ============================================================
-      # 5. RESTORE PREVIOUS APP LIST
-      # ============================================================
-      - name: Restore previous app list
-        shell: powershell
-        env:
-          B2_BUCKET: ${{ secrets.B2_BUCKET }}
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $rclone = "$env:RCLONE_DIR\rclone.exe"
-
-          $appsFile = "$env:APPS_FILE"
-
-          $remote = `
-            "b2remote:$env:B2_BUCKET/apps/apps.json"
-
-          Write-Host "=============================================="
-          Write-Host "RESTORING PREVIOUS APP LIST"
-          Write-Host "=============================================="
-
-          Remove-Item `
-            "$appsFile" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          & $rclone copyto `
-            "$remote" `
-            "$appsFile" `
-            --config "$env:RCLONE_CONFIG" `
-            --retries 5 `
-            --low-level-retries 10
-
-          if (Test-Path "$appsFile") {
-
-            $info = Get-Item "$appsFile"
-
-            Write-Host "Previous app list restored."
-            Write-Host "Size: $($info.Length) bytes"
-
-          }
-          else {
-
-            Write-Host "No previous app backup found."
-
-          }
-
-
-      # ============================================================
-      # 6. RESTORE / INSTALL APPLICATIONS
-      # ============================================================
-      - name: Restore installed applications
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $appsFile = "$env:APPS_FILE"
-
-          Write-Host "=============================================="
-          Write-Host "RESTORING APPLICATIONS"
-          Write-Host "=============================================="
-
-          if (-not (Test-Path "$appsFile")) {
-
-            Write-Host "No apps.json found."
-            Write-Host "Skipping application restore."
-
-            exit 0
-          }
-
-          Write-Host "Importing applications..."
-
-          winget import `
-            --import-file "$appsFile" `
-            --accept-source-agreements `
-            --accept-package-agreements `
-            --ignore-unavailable `
-            --disable-interactivity
-
-          $importCode = $LASTEXITCODE
-
-          Write-Host ""
-          Write-Host "winget import exit code: $importCode"
-
-          if ($importCode -ne 0) {
-
-            Write-Warning "Some applications may not have been restored."
-
-            Write-Warning "The RDP session will continue."
-
-          }
-          else {
-
-            Write-Host "Application restore completed."
-
-          }
-
-
-      # ============================================================
-      # 7. CREATE RDP USER
+      # 5. CREATE RDP USER
       # ============================================================
       - name: Create RDP user
         shell: powershell
@@ -318,67 +139,48 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=============================================="
-          Write-Host "CREATING RDP USER"
-          Write-Host "=============================================="
-
-          $username = "RDP"
-
-          $securePassword = ConvertTo-SecureString `
+          $password = ConvertTo-SecureString `
             "$env:RDP_PASSWORD" `
             -AsPlainText `
             -Force
 
-          $existing = Get-LocalUser `
-            -Name "$username" `
+          $user = Get-LocalUser `
+            -Name "$env:RDP_USER" `
             -ErrorAction SilentlyContinue
 
-          if ($existing) {
-
-            Write-Host "RDP user already exists."
+          if ($user) {
 
             Set-LocalUser `
-              -Name "$username" `
-              -Password $securePassword
+              -Name "$env:RDP_USER" `
+              -Password $password
 
-          }
-          else {
+          } else {
 
             New-LocalUser `
-              -Name "$username" `
-              -Password $securePassword `
+              -Name "$env:RDP_USER" `
+              -Password $password `
               -PasswordNeverExpires `
               -AccountNeverExpires `
               -UserMayNotChangePassword
-
-            Write-Host "RDP user created."
-
           }
 
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member "$username" `
+            -Member "$env:RDP_USER" `
             -ErrorAction SilentlyContinue
 
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member "$username" `
+            -Member "$env:RDP_USER" `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP permissions configured."
-
-
       # ============================================================
-      # 8. ENABLE REMOTE DESKTOP
+      # 6. ENABLE RDP
       # ============================================================
-      - name: Enable Remote Desktop
+      - name: Enable RDP
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-
-          Write-Host "=============================================="
-          Write-Host "ENABLING REMOTE DESKTOP"
-          Write-Host "=============================================="
 
           Set-ItemProperty `
             -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
@@ -394,31 +196,161 @@ jobs:
             -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
-          Write-Host "Remote Desktop enabled."
-
-
       # ============================================================
-      # 9. INSTALL TAILSCALE
+      # 7. CREATE INITIAL BASELINE
+      #
+      # Everything existing here is considered:
+      # "ALREADY AVAILABLE"
+      #
+      # Therefore it will NOT be backed up.
       # ============================================================
-      - name: Install Tailscale
+      - name: Create initial game baseline
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
 
-          Write-Host "=============================================="
-          Write-Host "INSTALLING TAILSCALE"
-          Write-Host "=============================================="
+          Write-Host "=========================================="
+          Write-Host "CREATING INITIAL BASELINE"
+          Write-Host "=========================================="
 
+          $roots = @(
+            "C:\Games",
+            "D:\Games",
+            "C:\XboxGames",
+            "$env:RDP_HOME"
+          )
+
+          $items = @()
+
+          foreach ($root in $roots) {
+
+            if (-not (Test-Path $root)) {
+              Write-Host "SKIP: $root"
+              continue
+            }
+
+            Write-Host "Scanning: $root"
+
+            try {
+
+              Get-ChildItem `
+                -LiteralPath $root `
+                -Recurse `
+                -File `
+                -Force `
+                -ErrorAction SilentlyContinue |
+              ForEach-Object {
+
+                $items += [PSCustomObject]@{
+                  Path = $_.FullName
+                  Length = $_.Length
+                  LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                }
+              }
+
+            } catch {
+
+              Write-Warning "Could not scan $root"
+            }
+          }
+
+          $items |
+            ConvertTo-Json -Depth 3 |
+            Set-Content `
+              -Path "$env:MANIFEST" `
+              -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "BASELINE FILES: $($items.Count)"
+          Write-Host "Baseline saved to $env:MANIFEST"
+
+      # ============================================================
+      # 8. RESTORE PREVIOUSLY BACKED-UP NEW GAME DATA
+      # ============================================================
+      - name: Restore previous game backup
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "=========================================="
+          Write-Host "RESTORING PREVIOUS GAME BACKUP"
+          Write-Host "=========================================="
+
+          & $rclone copy `
+            "b2remote:$env:B2_BUCKET/new-games" `
+            "C:\" `
+            --config "$env:RCLONE_CONFIG" `
+            --retries 5 `
+            --low-level-retries 10 `
+            --transfers 4 `
+            --checkers 8 `
+            --stats 30s
+
+          Write-Host "Previous game data restore finished."
+
+      # ============================================================
+      # 9. CREATE POST-RESTORE BASELINE
+      #
+      # Restored files are now also considered known.
+      # This prevents them from being uploaded again immediately.
+      # ============================================================
+      - name: Update baseline after restore
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $roots = @(
+            "C:\Games",
+            "D:\Games",
+            "C:\XboxGames",
+            "$env:RDP_HOME"
+          )
+
+          $items = @()
+
+          foreach ($root in $roots) {
+
+            if (-not (Test-Path $root)) {
+              continue
+            }
+
+            Get-ChildItem `
+              -LiteralPath $root `
+              -Recurse `
+              -File `
+              -Force `
+              -ErrorAction SilentlyContinue |
+            ForEach-Object {
+
+              $items += [PSCustomObject]@{
+                Path = $_.FullName
+                Length = $_.Length
+                LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+              }
+            }
+          }
+
+          $items |
+            ConvertTo-Json -Depth 3 |
+            Set-Content `
+              -Path "$env:MANIFEST" `
+              -Encoding UTF8
+
+          Write-Host "POST-RESTORE BASELINE: $($items.Count) files"
+
+      # ============================================================
+      # 10. TAILSCALE
+      # ============================================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
           choco install tailscale -y --no-progress
-
           Start-Sleep -Seconds 10
 
-          Write-Host "Tailscale installation completed."
-
-
-      # ============================================================
-      # 10. CONNECT TAILSCALE
-      # ============================================================
       - name: Connect Tailscale
         shell: powershell
         env:
@@ -426,37 +358,20 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "=============================================="
-          Write-Host "CONNECTING TAILSCALE"
-          Write-Host "=============================================="
-
           $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 
-          if (-not (Test-Path "$tailscale")) {
-
-            $tailscale = `
-              "C:\Program Files\Tailscale IPN\tailscale.exe"
-
-          }
-
-          if (-not (Test-Path "$tailscale")) {
-
-            $cmd = Get-Command `
-              tailscale.exe `
+          if (-not (Test-Path $tailscale)) {
+            $cmd = Get-Command tailscale.exe `
               -ErrorAction SilentlyContinue
 
             if ($cmd) {
               $tailscale = $cmd.Source
             }
-
           }
 
-          if (-not $tailscale) {
-            throw "tailscale.exe not found"
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale not found"
           }
-
-          Write-Host "Tailscale executable:"
-          Write-Host "$tailscale"
 
           & $tailscale up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
@@ -464,25 +379,19 @@ jobs:
 
           Start-Sleep -Seconds 10
 
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "TAILSCALE STATUS"
-          Write-Host "=============================================="
-
           & $tailscale status
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "TAILSCALE IPv4"
-          Write-Host "=============================================="
-
           & $tailscale ip -4
 
-
       # ============================================================
-      # 11. KEEP RDP ALIVE + AUTO APP BACKUP
+      # 11. AUTO SCAN + BACKUP
+      #
+      # Every 5 minutes:
+      #
+      # New file          -> backup
+      # Modified file     -> backup
+      # Existing unchanged -> ignore
       # ============================================================
-      - name: Keep RDP alive + Auto Backup Applications
+      - name: Auto detect and backup new game data
         shell: powershell
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
@@ -491,265 +400,190 @@ jobs:
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
 
-          $appsFile = "$env:APPS_FILE"
-
-          $tempFile = `
-            "$env:WORK_DIR\apps.new.json"
-
           $remote = `
-            "b2remote:$env:B2_BUCKET/apps/apps.json"
+            "b2remote:$env:B2_BUCKET/new-games"
 
-          # ========================================================
-          # RDP SESSION TIME
-          # ========================================================
+          $endTime = (Get-Date).AddMinutes(325)
 
-          $endTime = `
-            (Get-Date).AddMinutes(335)
+          $roots = @(
+            "C:\Games",
+            "D:\Games",
+            "C:\XboxGames",
+            "$env:RDP_HOME"
+          )
 
-          $backupNumber = 0
-
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "RDP IS READY"
-          Write-Host "================================================"
-
-          Write-Host ""
-          Write-Host "Application backup:"
-          Write-Host "EVERY 5 MINUTES"
-
-          Write-Host ""
-          Write-Host "Backup path:"
-          Write-Host "$remote"
-
-          Write-Host ""
-
-          # ========================================================
-          # BACKUP LOOP
-          # ========================================================
+          $iteration = 0
 
           while ((Get-Date) -lt $endTime) {
 
-            $backupNumber++
+            $iteration++
 
             Write-Host ""
-            Write-Host "================================================"
-            Write-Host "APP BACKUP #$backupNumber"
-            Write-Host "TIME: $(Get-Date)"
-            Write-Host "================================================"
+            Write-Host "=========================================="
+            Write-Host "GAME SCAN #$iteration"
+            Write-Host (Get-Date)
+            Write-Host "=========================================="
 
-            # --------------------------------------------------------
-            # Delete temporary file
-            # --------------------------------------------------------
+            # ------------------------------------------------------
+            # Load previous baseline
+            # ------------------------------------------------------
 
-            Remove-Item `
-              "$tempFile" `
-              -Force `
-              -ErrorAction SilentlyContinue
+            $baseline = @{}
 
-            # --------------------------------------------------------
-            # Export installed applications
-            # --------------------------------------------------------
+            if (Test-Path "$env:MANIFEST") {
 
-            Write-Host "Exporting installed applications..."
+              try {
 
-            winget export `
-              --output "$tempFile" `
-              --include-unknown `
-              --accept-source-agreements `
-              --disable-interactivity
+                $old = Get-Content `
+                  "$env:MANIFEST" `
+                  -Raw |
+                  ConvertFrom-Json
 
-            $exportCode = $LASTEXITCODE
+                foreach ($item in $old) {
 
-            # --------------------------------------------------------
-            # Check export
-            # --------------------------------------------------------
+                  $baseline[$item.Path] = `
+                    "$($item.Length)|$($item.LastWriteTimeUtc)"
+                }
 
-            if (
-              $exportCode -eq 0 `
-              -and `
-              (Test-Path "$tempFile")
-            ) {
+              } catch {
 
-              Write-Host "winget export successful."
-
-              # ------------------------------------------------------
-              # Replace local known-good backup
-              # ------------------------------------------------------
-
-              Move-Item `
-                "$tempFile" `
-                "$appsFile" `
-                -Force
-
-              Write-Host "Local apps.json updated."
-
-              # ------------------------------------------------------
-              # Upload to B2
-              # ------------------------------------------------------
-
-              Write-Host "Uploading apps.json to B2..."
-
-              & $rclone copyto `
-                "$appsFile" `
-                "$remote" `
-                --config "$env:RCLONE_CONFIG" `
-                --retries 5 `
-                --low-level-retries 10 `
-                --stats 10s
-
-              $uploadCode = $LASTEXITCODE
-
-              if ($uploadCode -eq 0) {
-
-                Write-Host ""
-                Write-Host "=============================================="
-                Write-Host "BACKUP SUCCESSFUL"
-                Write-Host "=============================================="
-
+                Write-Warning "Could not load baseline."
               }
-              else {
-
-                Write-Warning `
-                  "B2 upload failed."
-
-                Write-Warning `
-                  "Local apps.json is preserved."
-
-              }
-
             }
-            else {
 
-              Write-Warning `
-                "winget export failed."
+            $current = @()
 
-              Write-Warning `
-                "Exit code: $exportCode"
+            foreach ($root in $roots) {
 
-              Write-Warning `
-                "Previous successful backup is preserved."
+              if (-not (Test-Path $root)) {
+                continue
+              }
 
-              Remove-Item `
-                "$tempFile" `
+              Write-Host "Scanning: $root"
+
+              Get-ChildItem `
+                -LiteralPath $root `
+                -Recurse `
+                -File `
                 -Force `
-                -ErrorAction SilentlyContinue
+                -ErrorAction SilentlyContinue |
+              ForEach-Object {
 
+                $signature = `
+                  "$($_.Length)|$($_.LastWriteTimeUtc.ToString('o'))"
+
+                $current += [PSCustomObject]@{
+                  Path = $_.FullName
+                  Length = $_.Length
+                  LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                }
+
+                $oldSignature = $baseline[$_.FullName]
+
+                # --------------------------------------------------
+                # NEW OR CHANGED FILE
+                # --------------------------------------------------
+
+                if ($null -eq $oldSignature -or `
+                    $oldSignature -ne $signature) {
+
+                  $fullPath = $_.FullName
+
+                  # -----------------------------------------------
+                  # Convert absolute path to backup-relative path
+                  # -----------------------------------------------
+
+                  if ($fullPath.StartsWith("C:\", `
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+
+                    $relative = `
+                      $fullPath.Substring(3)
+
+                    $destination = `
+                      "$remote/C/$relative"
+
+                  } elseif ($fullPath.StartsWith("D:\", `
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+
+                    $relative = `
+                      $fullPath.Substring(3)
+
+                    $destination = `
+                      "$remote/D/$relative"
+
+                  } else {
+
+                    continue
+                  }
+
+                  Write-Host ""
+                  Write-Host "NEW/CHANGED:"
+                  Write-Host "$fullPath"
+
+                  # -----------------------------------------------
+                  # Upload only this file
+                  # -----------------------------------------------
+
+                  $parent = Split-Path `
+                    $destination `
+                    -Parent
+
+                  & $rclone copyto `
+                    "$fullPath" `
+                    "$destination" `
+                    --config "$env:RCLONE_CONFIG" `
+                    --retries 3 `
+                    --low-level-retries 5 `
+                    --stats 5s
+
+                  if ($LASTEXITCODE -eq 0) {
+
+                    Write-Host "BACKUP OK"
+
+                  } else {
+
+                    Write-Warning `
+                      "BACKUP FAILED: $fullPath"
+                  }
+                }
+              }
             }
 
-            # --------------------------------------------------------
-            # Display local backup status
-            # --------------------------------------------------------
+            # ------------------------------------------------------
+            # Save current baseline
+            # ------------------------------------------------------
 
-            if (Test-Path "$appsFile") {
-
-              $info = Get-Item "$appsFile"
-
-              Write-Host ""
-              Write-Host "Current backup:"
-              Write-Host "File: $($info.FullName)"
-              Write-Host "Size: $($info.Length) bytes"
-              Write-Host "Updated: $($info.LastWriteTime)"
-
-            }
-
-            # --------------------------------------------------------
-            # Wait 5 minutes
-            # --------------------------------------------------------
+            $current |
+              ConvertTo-Json -Depth 3 |
+              Set-Content `
+                "$env:MANIFEST" `
+                -Encoding UTF8
 
             Write-Host ""
-            Write-Host "Next backup in 5 minutes..."
+            Write-Host "FILES SCANNED: $($current.Count)"
 
-            $sleepUntil = `
-              (Get-Date).AddMinutes(5)
+            # ------------------------------------------------------
+            # Wait 5 minutes
+            # ------------------------------------------------------
+
+            $next = (Get-Date).AddMinutes(5)
 
             while (
-              (Get-Date) -lt $sleepUntil `
-              -and `
+              (Get-Date) -lt $next -and
               (Get-Date) -lt $endTime
             ) {
 
               Start-Sleep -Seconds 10
-
             }
-
-          }
-
-
-          # ========================================================
-          # FINAL BACKUP
-          # ========================================================
-
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "FINAL APPLICATION BACKUP"
-          Write-Host "================================================"
-
-          Remove-Item `
-            "$tempFile" `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          winget export `
-            --output "$tempFile" `
-            --include-unknown `
-            --accept-source-agreements `
-            --disable-interactivity
-
-          $finalExportCode = $LASTEXITCODE
-
-          if (
-            $finalExportCode -eq 0 `
-            -and `
-            (Test-Path "$tempFile")
-          ) {
-
-            Move-Item `
-              "$tempFile" `
-              "$appsFile" `
-              -Force
-
-            Write-Host "Final export successful."
-
-            & $rclone copyto `
-              "$appsFile" `
-              "$remote" `
-              --config "$env:RCLONE_CONFIG" `
-              --retries 5 `
-              --low-level-retries 10 `
-              --stats 10s
-
-            if ($LASTEXITCODE -eq 0) {
-
-              Write-Host ""
-              Write-Host "FINAL BACKUP SUCCESSFUL."
-
-            }
-            else {
-
-              Write-Warning `
-                "Final B2 upload failed."
-
-            }
-
-          }
-          else {
-
-            Write-Warning `
-              "Final winget export failed."
-
-            Write-Warning `
-              "Previous successful backup remains available."
-
           }
 
           Write-Host ""
-          Write-Host "RDP session ending."
-
+          Write-Host "AUTO BACKUP LOOP FINISHED."
 
       # ============================================================
-      # 12. VERIFY B2
+      # 12. FINAL SCAN
       # ============================================================
-      - name: Verify application backup
+      - name: Final game scan
         shell: powershell
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
@@ -758,18 +592,129 @@ jobs:
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
 
-          Write-Host ""
-          Write-Host "================================================"
-          Write-Host "VERIFYING B2 APPLICATION BACKUP"
-          Write-Host "================================================"
+          $remote = `
+            "b2remote:$env:B2_BUCKET/new-games"
 
-          & $rclone ls `
-            "b2remote:$env:B2_BUCKET/apps" `
+          $roots = @(
+            "C:\Games",
+            "D:\Games",
+            "C:\XboxGames",
+            "$env:RDP_HOME"
+          )
+
+          Write-Host "=========================================="
+          Write-Host "FINAL GAME SCAN"
+          Write-Host "=========================================="
+
+          $baseline = @{}
+
+          if (Test-Path "$env:MANIFEST") {
+
+            $old = Get-Content `
+              "$env:MANIFEST" `
+              -Raw |
+              ConvertFrom-Json
+
+            foreach ($item in $old) {
+
+              $baseline[$item.Path] = `
+                "$($item.Length)|$($item.LastWriteTimeUtc)"
+            }
+          }
+
+          $current = @()
+
+          foreach ($root in $roots) {
+
+            if (-not (Test-Path $root)) {
+              continue
+            }
+
+            Get-ChildItem `
+              -LiteralPath $root `
+              -Recurse `
+              -File `
+              -Force `
+              -ErrorAction SilentlyContinue |
+            ForEach-Object {
+
+              $signature = `
+                "$($_.Length)|$($_.LastWriteTimeUtc.ToString('o'))"
+
+              $current += [PSCustomObject]@{
+                Path = $_.FullName
+                Length = $_.Length
+                LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+              }
+
+              if (
+                $null -eq $baseline[$_.FullName] -or
+                $baseline[$_.FullName] -ne $signature
+              ) {
+
+                if (
+                  $_.FullName.StartsWith(
+                    "C:\",
+                    [System.StringComparison]::OrdinalIgnoreCase
+                  )
+                ) {
+
+                  $relative = $_.FullName.Substring(3)
+
+                  $destination = `
+                    "$remote/C/$relative"
+
+                } elseif (
+                  $_.FullName.StartsWith(
+                    "D:\",
+                    [System.StringComparison]::OrdinalIgnoreCase
+                  )
+                ) {
+
+                  $relative = $_.FullName.Substring(3)
+
+                  $destination = `
+                    "$remote/D/$relative"
+
+                } else {
+
+                  return
+                }
+
+                Write-Host "FINAL BACKUP: $($_.FullName)"
+
+                & $rclone copyto `
+                  "$($_.FullName)" `
+                  "$destination" `
+                  --config "$env:RCLONE_CONFIG" `
+                  --retries 5 `
+                  --low-level-retries 10 `
+                  --stats 10s
+              }
+            }
+          }
+
+          Write-Host "FINAL SCAN COMPLETE."
+
+      # ============================================================
+      # 13. SHOW B2 SIZE
+      # ============================================================
+      - name: Verify game backup
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "=========================================="
+          Write-Host "BACKED UP GAME DATA"
+          Write-Host "=========================================="
+
+          & $rclone size `
+            "b2remote:$env:B2_BUCKET/new-games" `
             --config "$env:RCLONE_CONFIG"
 
           Write-Host ""
-          Write-Host "Expected backup:"
-          Write-Host "apps/apps.json"
-
-          Write-Host ""
-          Write-Host "Workflow completed."
+          Write-Host "WORKFLOW COMPLETE."
