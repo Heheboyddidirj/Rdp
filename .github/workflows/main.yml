@@ -1,4 +1,4 @@
-name: Windows RDP + Tailscale + B2 + StarDesk + Auto Game Persistence V5
+name: Windows RDP + Tailscale + B2 + StarDesk + Auto Game Persistence V6
 
 on:
   workflow_dispatch:
@@ -19,9 +19,10 @@ jobs:
 
     steps:
 
-      # ============================================================
+      # =========================================================
       # 1. PREPARE
-      # ============================================================
+      # =========================================================
+
       - name: Prepare directories
         shell: powershell
         run: |
@@ -34,14 +35,16 @@ jobs:
             -Path "$env:WORK_DIR" | Out-Null
 
           Write-Host "=========================================="
-          Write-Host "RDP PERSISTENCE V5"
+          Write-Host "RDP PERSISTENCE V6"
           Write-Host "=========================================="
-          Write-Host "User: $env:RDP_USER"
-          Write-Host "Home: $env:RDP_HOME"
+          Write-Host "RDP USER : $env:RDP_USER"
+          Write-Host "RDP HOME : $env:RDP_HOME"
 
-      # ============================================================
+
+      # =========================================================
       # 2. INSTALL RCLONE
-      # ============================================================
+      # =========================================================
+
       - name: Install rclone
         shell: powershell
         run: |
@@ -52,6 +55,8 @@ jobs:
 
           Remove-Item "$zip" -Force -ErrorAction SilentlyContinue
           Remove-Item "$extract" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Downloading rclone..."
 
           Invoke-WebRequest `
             -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" `
@@ -89,17 +94,23 @@ jobs:
             throw "rclone test failed"
           }
 
-          Write-Host "rclone OK."
+          Write-Host "rclone installed successfully."
 
-      # ============================================================
-      # 3. CONFIGURE B2
-      # ============================================================
+
+      # =========================================================
+      # 3. CONFIGURE NATIVE BACKBLAZE B2
+      #
+      # V5 used S3 and caused:
+      # S3 HeadObject 403 Forbidden
+      #
+      # V6 uses native B2 backend.
+      # =========================================================
+
       - name: Configure Backblaze B2
         shell: powershell
         env:
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -110,42 +121,59 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
-          & $rclone config create b2remote s3 `
-            provider Other `
-            access_key_id "$env:B2_KEY_ID" `
-            secret_access_key "$env:B2_APPLICATION_KEY" `
-            endpoint "$env:B2_ENDPOINT" `
+          Write-Host "=========================================="
+          Write-Host "CONFIGURING NATIVE BACKBLAZE B2"
+          Write-Host "=========================================="
+
+          & $rclone config create `
+            b2remote `
+            b2 `
+            account "$env:B2_KEY_ID" `
+            key "$env:B2_APPLICATION_KEY" `
             --config "$env:RCLONE_CONFIG"
 
           if ($LASTEXITCODE -ne 0) {
             throw "B2 configuration failed"
           }
 
-          Write-Host "B2 configured."
+          Write-Host "Native B2 remote created."
 
-      # ============================================================
+
+      # =========================================================
       # 4. TEST B2
-      # ============================================================
-      - name: Test B2
+      # =========================================================
+
+      - name: Test B2 connection
         shell: powershell
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          & "$env:RCLONE_DIR\rclone.exe" lsd `
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "=========================================="
+          Write-Host "TESTING B2"
+          Write-Host "=========================================="
+
+          Write-Host "Listing bucket..."
+
+          & $rclone lsf `
             "b2remote:$env:B2_BUCKET" `
-            --config "$env:RCLONE_CONFIG"
+            --config "$env:RCLONE_CONFIG" `
+            --max-depth 2
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Cannot access B2 bucket"
+            throw "Cannot access B2 bucket."
           }
 
           Write-Host "B2 connection OK."
 
-      # ============================================================
+
+      # =========================================================
       # 5. CREATE RDP USER
-      # ============================================================
+      # =========================================================
+
       - name: Create RDP user
         shell: powershell
         env:
@@ -170,7 +198,8 @@ jobs:
               -Name "$username" `
               -Password $password
 
-          } else {
+          }
+          else {
 
             New-LocalUser `
               -Name "$username" `
@@ -192,9 +221,11 @@ jobs:
 
           Write-Host "RDP user ready."
 
-      # ============================================================
+
+      # =========================================================
       # 6. ENABLE RDP
-      # ============================================================
+      # =========================================================
+
       - name: Enable RDP
         shell: powershell
         run: |
@@ -216,41 +247,146 @@ jobs:
 
           Write-Host "RDP enabled."
 
-      # ============================================================
-      # 7. INSTALL STAR DESK
-      # ============================================================
-      - name: Install StarDesk
+
+      # =========================================================
+      # 7. DEFINE SCAN ROOTS
+      #
+      # These include:
+      # - Games
+      # - Xbox games
+      # - Program Files
+      # - ProgramData
+      # - RDP profile
+      #
+      # Anything already present at baseline is considered
+      # PRE-EXISTING and will NOT be uploaded.
+      # =========================================================
+
+      - name: Define scan roots
         shell: powershell
+        run: |
+          $roots = @(
+            "C:\Games",
+            "D:\Games",
+            "C:\XboxGames",
+            "C:\Program Files",
+            "C:\Program Files (x86)",
+            "C:\ProgramData",
+            "$env:RDP_HOME\AppData\Local",
+            "$env:RDP_HOME\AppData\Roaming",
+            "$env:RDP_HOME\AppData\LocalLow",
+            "$env:RDP_HOME\Documents",
+            "$env:RDP_HOME\Saved Games"
+          )
+
+          $roots |
+            Set-Content `
+              "$env:WORK_DIR\scan-roots.txt" `
+              -Encoding UTF8
+
+          Write-Host "=========================================="
+          Write-Host "SCAN ROOTS"
+          Write-Host "=========================================="
+
+          $roots |
+            ForEach-Object {
+              Write-Host " - $_"
+            }
+
+
+      # =========================================================
+      # 8. RESTORE PREVIOUS GAME DATA
+      #
+      # IMPORTANT:
+      #
+      # new-games/C/Program Files/...
+      #        -> C:\Program Files/...
+      #
+      # new-games/D/Games/...
+      #        -> D:\Games/...
+      #
+      # No C:\C\ or C:\D\ problem.
+      # =========================================================
+
+      - name: Restore previous new game data
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Continue"
 
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+
           Write-Host "=========================================="
-          Write-Host "INSTALLING STAR DESK"
+          Write-Host "RESTORING PREVIOUS GAME DATA"
           Write-Host "=========================================="
 
-          winget install `
-            --id Stardesk.Stardesk `
-            --exact `
-            --silent `
-            --accept-package-agreements `
-            --accept-source-agreements `
-            --disable-interactivity
+          # -----------------------------
+          # Restore C:
+          # -----------------------------
 
-          $code = $LASTEXITCODE
+          Write-Host ""
+          Write-Host "Restoring C: data..."
 
-          Write-Host "StarDesk install exit code: $code"
+          & $rclone copy `
+            "b2remote:$env:B2_BUCKET/new-games/C" `
+            "C:\" `
+            --config "$env:RCLONE_CONFIG" `
+            --retries 5 `
+            --low-level-retries 10 `
+            --transfers 8 `
+            --checkers 16 `
+            --fast-list `
+            --stats 30s
 
-          Start-Sleep -Seconds 10
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "C: restore returned exit code $LASTEXITCODE"
+          }
+          else {
+            Write-Host "C: restore completed."
+          }
 
-          winget list `
-            --id Stardesk.Stardesk `
-            --exact
 
-          Write-Host "StarDesk installation checked."
+          # -----------------------------
+          # Restore D:
+          # -----------------------------
 
-      # ============================================================
-      # 8. RESTORE PREVIOUS APP LIST
-      # ============================================================
+          if (Test-Path "D:\") {
+
+            Write-Host ""
+            Write-Host "Restoring D: data..."
+
+            & $rclone copy `
+              "b2remote:$env:B2_BUCKET/new-games/D" `
+              "D:\" `
+              --config "$env:RCLONE_CONFIG" `
+              --retries 5 `
+              --low-level-retries 10 `
+              --transfers 8 `
+              --checkers 16 `
+              --fast-list `
+              --stats 30s
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "D: restore returned exit code $LASTEXITCODE"
+            }
+            else {
+              Write-Host "D: restore completed."
+            }
+
+          }
+          else {
+            Write-Host "D: drive does not exist. Skipping D:"
+          }
+
+          Write-Host ""
+          Write-Host "Game data restore finished."
+
+
+      # =========================================================
+      # 9. RESTORE APP LIST
+      # =========================================================
+
       - name: Restore application list
         shell: powershell
         env:
@@ -266,28 +402,34 @@ jobs:
             -Force `
             -ErrorAction SilentlyContinue
 
+          Write-Host "Checking previous apps.json..."
+
           & $rclone copyto `
             "b2remote:$env:B2_BUCKET/apps/apps.json" `
             "$appsFile" `
             --config "$env:RCLONE_CONFIG" `
-            --retries 5 `
-            --low-level-retries 10
+            --retries 3 `
+            --low-level-retries 5
 
-          if (Test-Path "$appsFile") {
-
-            $size = (Get-Item "$appsFile").Length
+          if ($LASTEXITCODE -eq 0 -and (Test-Path "$appsFile")) {
 
             Write-Host "apps.json restored."
-            Write-Host "Size: $size bytes"
 
-          } else {
+          }
+          else {
 
             Write-Host "No previous apps.json."
+            Write-Host "Continuing without app restore."
+
           }
 
-      # ============================================================
-      # 9. RESTORE APPLICATIONS
-      # ============================================================
+          exit 0
+
+
+      # =========================================================
+      # 10. RESTORE APPLICATIONS USING WINGET
+      # =========================================================
+
       - name: Restore applications
         shell: powershell
         run: |
@@ -296,9 +438,14 @@ jobs:
           $appsFile = "$env:WORK_DIR\apps.json"
 
           if (-not (Test-Path "$appsFile")) {
-            Write-Host "No app backup."
+
+            Write-Host "No application backup."
             exit 0
           }
+
+          Write-Host "=========================================="
+          Write-Host "RESTORING APPLICATIONS"
+          Write-Host "=========================================="
 
           winget import `
             --import-file "$appsFile" `
@@ -306,138 +453,70 @@ jobs:
             --accept-package-agreements `
             --ignore-unavailable
 
-          Write-Host "winget restore exit code: $LASTEXITCODE"
+          Write-Host "winget exit code: $LASTEXITCODE"
 
-      # ============================================================
-      # 10. GAME / PROGRAM ROOTS
-      #
-      # Everything existing here BEFORE the baseline is ignored.
-      # ============================================================
-      - name: Define scan roots
-        shell: powershell
-        run: |
-          $roots = @(
-            "C:\Games",
-            "D:\Games",
-            "C:\XboxGames",
-            "C:\Program Files",
-            "C:\Program Files (x86)",
-            "C:\ProgramData",
-            "$env:RDP_HOME"
-          )
+          # Do not kill the whole RDP workflow if one application
+          # cannot be restored.
+          exit 0
 
-          $roots |
-            Set-Content `
-              "$env:WORK_DIR\scan-roots.txt" `
-              -Encoding UTF8
 
-          Write-Host "Scan roots:"
+      # =========================================================
+      # 11. INSTALL STAR DESK
+      # =========================================================
 
-          $roots |
-            ForEach-Object {
-              Write-Host " - $_"
-            }
-
-      # ============================================================
-      # 11. RESTORE PREVIOUS NEW-GAME BACKUP
-      # ============================================================
-      - name: Restore previous new game data
-        shell: powershell
-        env:
-          B2_BUCKET: ${{ secrets.B2_BUCKET }}
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          $rclone = "$env:RCLONE_DIR\rclone.exe"
-
-          Write-Host "=========================================="
-          Write-Host "RESTORING PREVIOUS NEW GAME DATA"
-          Write-Host "=========================================="
-
-          & $rclone copy `
-            "b2remote:$env:B2_BUCKET/new-games" `
-            "C:\" `
-            --config "$env:RCLONE_CONFIG" `
-            --retries 5 `
-            --low-level-retries 10 `
-            --transfers 4 `
-            --checkers 8 `
-            --stats 30s
-
-          Write-Host "Restore finished."
-
-      # ============================================================
-      # 12. CREATE BASELINE
-      #
-      # Files present at this exact point are considered
-      # pre-existing and WILL NOT be backed up.
-      # ============================================================
-      - name: Create initial baseline
+      - name: Install StarDesk
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
 
           Write-Host "=========================================="
-          Write-Host "CREATING INITIAL BASELINE"
+          Write-Host "INSTALLING STAR DESK"
           Write-Host "=========================================="
 
-          $roots = Get-Content `
-            "$env:WORK_DIR\scan-roots.txt"
+          winget install `
+            --id Stardesk.Stardesk `
+            --exact `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements
 
-          $items = @()
+          Write-Host "StarDesk winget exit code: $LASTEXITCODE"
 
-          foreach ($root in $roots) {
-
-            if (-not (Test-Path "$root")) {
-              Write-Host "SKIP: $root"
-              continue
-            }
-
-            Write-Host "Scanning: $root"
-
-            Get-ChildItem `
-              -LiteralPath "$root" `
-              -Recurse `
-              -File `
-              -Force `
-              -ErrorAction SilentlyContinue |
-            ForEach-Object {
-
-              $items += [PSCustomObject]@{
-                Path = $_.FullName
-                Length = $_.Length
-                LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
-              }
-            }
-          }
-
-          $items |
-            ConvertTo-Json -Depth 3 |
-            Set-Content `
-              "$env:MANIFEST" `
-              -Encoding UTF8
+          Start-Sleep -Seconds 10
 
           Write-Host ""
-          Write-Host "BASELINE FILE COUNT: $($items.Count)"
-          Write-Host "Baseline created."
+          Write-Host "StarDesk package status:"
 
-      # ============================================================
-      # 13. TAILSCALE
-      # ============================================================
+          winget list `
+            --id Stardesk.Stardesk `
+            --exact
+
+          Write-Host ""
+          Write-Host "StarDesk installation checked."
+
+
+      # =========================================================
+      # 12. INSTALL TAILSCALE
+      # =========================================================
+
       - name: Install Tailscale
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
 
+          Write-Host "Installing Tailscale..."
+
           choco install tailscale -y --no-progress
 
           Start-Sleep -Seconds 10
 
-          Write-Host "Tailscale installed."
+          Write-Host "Tailscale installation finished."
 
-      # ============================================================
-      # 14. CONNECT TAILSCALE
-      # ============================================================
+
+      # =========================================================
+      # 13. CONNECT TAILSCALE
+      # =========================================================
+
       - name: Connect Tailscale
         shell: powershell
         env:
@@ -468,23 +547,157 @@ jobs:
 
           Start-Sleep -Seconds 10
 
-          Write-Host ""
+          Write-Host "=========================================="
           Write-Host "TAILSCALE STATUS"
+          Write-Host "=========================================="
+
           & $tailscale status
 
           Write-Host ""
-          Write-Host "TAILSCALE IPv4"
+          Write-Host "TAILSCALE IPv4:"
+
           & $tailscale ip -4
 
-      # ============================================================
-      # 15. AUTO DETECT + BACKUP
+
+      # =========================================================
+      # 14. CREATE BASELINE
       #
-      # New file       -> upload
-      # Changed file   -> upload
-      # Unchanged file -> ignore
+      # Everything existing NOW is considered pre-existing.
       #
-      # Scan interval: 5 minutes
-      # ============================================================
+      # Therefore:
+      # - Windows built-in programs -> ignored
+      # - preinstalled software -> ignored
+      # - restored games -> ignored
+      # - restored files -> ignored
+      #
+      # Anything downloaded AFTER this point becomes NEW.
+      # =========================================================
+
+      - name: Create initial baseline
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=========================================="
+          Write-Host "CREATING INITIAL BASELINE"
+          Write-Host "=========================================="
+
+          $roots = Get-Content `
+            "$env:WORK_DIR\scan-roots.txt"
+
+          $items = New-Object System.Collections.Generic.List[object]
+
+          foreach ($root in $roots) {
+
+            if (-not (Test-Path "$root")) {
+              Write-Host "SKIP: $root"
+              continue
+            }
+
+            Write-Host "Scanning: $root"
+
+            Get-ChildItem `
+              -LiteralPath "$root" `
+              -Recurse `
+              -File `
+              -Force `
+              -ErrorAction SilentlyContinue |
+            ForEach-Object {
+
+              $items.Add(
+                [PSCustomObject]@{
+                  Path = $_.FullName
+                  Length = $_.Length
+                  LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                }
+              )
+            }
+          }
+
+          $items |
+            ConvertTo-Json -Depth 3 |
+            Set-Content `
+              "$env:MANIFEST" `
+              -Encoding UTF8
+
+          Write-Host ""
+          Write-Host "BASELINE FILE COUNT: $($items.Count)"
+          Write-Host "Baseline created."
+
+
+      # =========================================================
+      # 15. BACKUP APP LIST
+      #
+      # This is done AFTER restore.
+      # StarDesk is included in apps.json automatically if winget
+      # recognizes it.
+      # =========================================================
+
+      - name: Backup application list
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $rclone = "$env:RCLONE_DIR\rclone.exe"
+          $appsFile = "$env:WORK_DIR\apps.json"
+
+          Write-Host "=========================================="
+          Write-Host "EXPORTING APPLICATION LIST"
+          Write-Host "=========================================="
+
+          winget export `
+            --output "$appsFile" `
+            --include-versions `
+            --accept-source-agreements
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "winget export failed."
+            exit 0
+          }
+
+          if (-not (Test-Path "$appsFile")) {
+            Write-Warning "apps.json was not created."
+            exit 0
+          }
+
+          & $rclone copyto `
+            "$appsFile" `
+            "b2remote:$env:B2_BUCKET/apps/apps.json" `
+            --config "$env:RCLONE_CONFIG" `
+            --retries 5 `
+            --low-level-retries 10
+
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "apps.json uploaded."
+          }
+          else {
+            Write-Warning "apps.json upload failed."
+          }
+
+          exit 0
+
+
+      # =========================================================
+      # 16. AUTO SCAN + BACKUP
+      #
+      # Every 5 minutes.
+      #
+      # NEW FILE:
+      #     upload
+      #
+      # CHANGED FILE:
+      #     upload
+      #
+      # EXISTING FILE:
+      #     ignore
+      #
+      # Deleted file:
+      #     NOT deleted from B2
+      #     because this is persistence, not mirror/sync.
+      # =========================================================
+
       - name: Auto detect and backup new games
         shell: powershell
         env:
@@ -494,12 +707,12 @@ jobs:
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
 
-          $remote = `
-            "b2remote:$env:B2_BUCKET/new-games"
+          $remote = "b2remote:$env:B2_BUCKET/new-games"
 
           $roots = Get-Content `
             "$env:WORK_DIR\scan-roots.txt"
 
+          # Keep runner alive for about 325 minutes.
           $endTime = (Get-Date).AddMinutes(325)
 
           $iteration = 0
@@ -514,9 +727,9 @@ jobs:
             Write-Host (Get-Date)
             Write-Host "=========================================="
 
-            # ------------------------------------------------------
-            # Load baseline
-            # ------------------------------------------------------
+            # -----------------------------------------
+            # Load previous baseline
+            # -----------------------------------------
 
             $baseline = @{}
 
@@ -531,21 +744,26 @@ jobs:
 
                 foreach ($item in $old) {
 
-                  $baseline[$item.Path] = `
+                  $baseline[$item.Path] =
                     "$($item.Length)|$($item.LastWriteTimeUtc)"
                 }
 
-              } catch {
+              }
+              catch {
 
                 Write-Warning "Could not read baseline."
               }
             }
 
-            $current = @()
 
-            # ------------------------------------------------------
-            # Scan every root
-            # ------------------------------------------------------
+            # -----------------------------------------
+            # Current scan
+            # -----------------------------------------
+
+            $current = New-Object System.Collections.Generic.List[object]
+
+            $newFiles = 0
+            $changedFiles = 0
 
             foreach ($root in $roots) {
 
@@ -553,6 +771,7 @@ jobs:
                 continue
               }
 
+              Write-Host ""
               Write-Host "Scanning: $root"
 
               Get-ChildItem `
@@ -563,32 +782,48 @@ jobs:
                 -ErrorAction SilentlyContinue |
               ForEach-Object {
 
-                $signature = `
+                $fullPath = $_.FullName
+
+                $signature =
                   "$($_.Length)|$($_.LastWriteTimeUtc.ToString('o'))"
 
-                $current += [PSCustomObject]@{
-                  Path = $_.FullName
-                  Length = $_.Length
-                  LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
-                }
+                $current.Add(
+                  [PSCustomObject]@{
+                    Path = $fullPath
+                    Length = $_.Length
+                    LastWriteTimeUtc =
+                      $_.LastWriteTimeUtc.ToString("o")
+                  }
+                )
 
-                $oldSignature = `
-                  $baseline[$_.FullName]
+                $oldSignature = $baseline[$fullPath]
 
-                # --------------------------------------------------
+                # -------------------------------------
                 # NEW OR CHANGED
-                # --------------------------------------------------
+                # -------------------------------------
 
                 if (
                   $null -eq $oldSignature -or
                   $oldSignature -ne $signature
                 ) {
 
-                  $fullPath = $_.FullName
+                  # Ignore files that are actively being written.
+                  # They will be caught during the next scan.
+                  $ageSeconds =
+                    ((Get-Date) - $_.LastWriteTime).TotalSeconds
 
-                  # -----------------------------------------------
-                  # C: drive
-                  # -----------------------------------------------
+                  if ($ageSeconds -lt 60) {
+
+                    Write-Host "WAIT: file still changing:"
+                    Write-Host "$fullPath"
+
+                    return
+                  }
+
+
+                  # -----------------------------------
+                  # C:
+                  # -----------------------------------
 
                   if (
                     $fullPath.StartsWith(
@@ -597,36 +832,48 @@ jobs:
                     )
                   ) {
 
-                    $relative = `
+                    $relative =
                       $fullPath.Substring(3)
 
-                    $destination = `
+                    $destination =
                       "$remote/C/$relative"
+                  }
 
-                  # -----------------------------------------------
-                  # D: drive
-                  # -----------------------------------------------
+                  # -----------------------------------
+                  # D:
+                  # -----------------------------------
 
-                  } elseif (
+                  elseif (
                     $fullPath.StartsWith(
                       "D:\",
                       [System.StringComparison]::OrdinalIgnoreCase
                     )
                   ) {
 
-                    $relative = `
+                    $relative =
                       $fullPath.Substring(3)
 
-                    $destination = `
+                    $destination =
                       "$remote/D/$relative"
+                  }
 
-                  } else {
+                  else {
 
                     return
                   }
 
-                  Write-Host ""
-                  Write-Host "NEW / CHANGED FILE:"
+
+                  if ($null -eq $oldSignature) {
+                    $newFiles++
+                    Write-Host ""
+                    Write-Host "NEW FILE:"
+                  }
+                  else {
+                    $changedFiles++
+                    Write-Host ""
+                    Write-Host "CHANGED FILE:"
+                  }
+
                   Write-Host "$fullPath"
 
                   & $rclone copyto `
@@ -635,13 +882,15 @@ jobs:
                     --config "$env:RCLONE_CONFIG" `
                     --retries 3 `
                     --low-level-retries 5 `
+                    --transfers 4 `
                     --stats 5s
 
                   if ($LASTEXITCODE -eq 0) {
 
                     Write-Host "BACKUP SUCCESS"
 
-                  } else {
+                  }
+                  else {
 
                     Write-Warning `
                       "BACKUP FAILED: $fullPath"
@@ -650,9 +899,10 @@ jobs:
               }
             }
 
-            # ------------------------------------------------------
-            # Update baseline
-            # ------------------------------------------------------
+
+            # -----------------------------------------
+            # Save new baseline
+            # -----------------------------------------
 
             $current |
               ConvertTo-Json -Depth 3 |
@@ -660,14 +910,61 @@ jobs:
                 "$env:MANIFEST" `
                 -Encoding UTF8
 
+
             Write-Host ""
-            Write-Host "FILES SCANNED: $($current.Count)"
+            Write-Host "------------------------------------------"
+            Write-Host "SCAN #$iteration COMPLETE"
+            Write-Host "FILES SCANNED : $($current.Count)"
+            Write-Host "NEW FILES     : $newFiles"
+            Write-Host "CHANGED FILES : $changedFiles"
+            Write-Host "------------------------------------------"
 
-            # ------------------------------------------------------
+
+            # -----------------------------------------
+            # Backup apps.json every scan
+            # -----------------------------------------
+
+            Write-Host "Updating application list..."
+
+            $appsFile = "$env:WORK_DIR\apps.json"
+
+            winget export `
+              --output "$appsFile" `
+              --include-versions `
+              --accept-source-agreements
+
+            if (
+              $LASTEXITCODE -eq 0 -and
+              (Test-Path "$appsFile")
+            ) {
+
+              & $rclone copyto `
+                "$appsFile" `
+                "$remote/../apps/apps.json" `
+                --config "$env:RCLONE_CONFIG" `
+                --retries 3 `
+                --low-level-retries 5
+
+              # If ../apps path isn't accepted by the backend,
+              # use the explicit bucket path below.
+              if ($LASTEXITCODE -ne 0) {
+
+                & $rclone copyto `
+                  "$appsFile" `
+                  "b2remote:$env:B2_BUCKET/apps/apps.json" `
+                  --config "$env:RCLONE_CONFIG" `
+                  --retries 3 `
+                  --low-level-retries 5
+              }
+            }
+
+
+            # -----------------------------------------
             # Wait 5 minutes
-            # ------------------------------------------------------
+            # -----------------------------------------
 
-            $nextScan = (Get-Date).AddMinutes(5)
+            $nextScan =
+              (Get-Date).AddMinutes(5)
 
             while (
               (Get-Date) -lt $nextScan -and
@@ -679,11 +976,15 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "AUTO BACKUP FINISHED."
+          Write-Host "=========================================="
+          Write-Host "AUTO BACKUP FINISHED"
+          Write-Host "=========================================="
 
-      # ============================================================
-      # 16. FINAL SCAN
-      # ============================================================
+
+      # =========================================================
+      # 17. FINAL BACKUP
+      # =========================================================
+
       - name: Final game backup
         shell: powershell
         env:
@@ -693,11 +994,11 @@ jobs:
 
           $rclone = "$env:RCLONE_DIR\rclone.exe"
 
-          $remote = `
+          $remote =
             "b2remote:$env:B2_BUCKET/new-games"
 
-          $roots = Get-Content `
-            "$env:WORK_DIR\scan-roots.txt"
+          $roots =
+            Get-Content "$env:WORK_DIR\scan-roots.txt"
 
           Write-Host "=========================================="
           Write-Host "FINAL GAME SCAN"
@@ -709,19 +1010,22 @@ jobs:
 
             try {
 
-              $old = Get-Content `
-                "$env:MANIFEST" `
-                -Raw |
-                ConvertFrom-Json
+              $old =
+                Get-Content `
+                  "$env:MANIFEST" `
+                  -Raw |
+                  ConvertFrom-Json
 
               foreach ($item in $old) {
 
-                $baseline[$item.Path] = `
+                $baseline[$item.Path] =
                   "$($item.Length)|$($item.LastWriteTimeUtc)"
               }
 
-            } catch {}
+            }
+            catch {}
           }
+
 
           foreach ($root in $roots) {
 
@@ -739,54 +1043,72 @@ jobs:
               -ErrorAction SilentlyContinue |
             ForEach-Object {
 
-              $signature = `
+              $fullPath = $_.FullName
+
+              $signature =
                 "$($_.Length)|$($_.LastWriteTimeUtc.ToString('o'))"
 
+              $oldSignature =
+                $baseline[$fullPath]
+
+
               if (
-                $null -eq $baseline[$_.FullName] -or
-                $baseline[$_.FullName] -ne $signature
+                $null -eq $oldSignature -or
+                $oldSignature -ne $signature
               ) {
 
+                # Skip actively changing files.
+                $ageSeconds =
+                  ((Get-Date) - $_.LastWriteTime).TotalSeconds
+
+                if ($ageSeconds -lt 60) {
+                  return
+                }
+
+
                 if (
-                  $_.FullName.StartsWith(
+                  $fullPath.StartsWith(
                     "C:\",
                     [System.StringComparison]::OrdinalIgnoreCase
                   )
                 ) {
 
-                  $relative = `
-                    $_.FullName.Substring(3)
+                  $relative =
+                    $fullPath.Substring(3)
 
-                  $destination = `
+                  $destination =
                     "$remote/C/$relative"
+                }
 
-                } elseif (
-                  $_.FullName.StartsWith(
+                elseif (
+                  $fullPath.StartsWith(
                     "D:\",
                     [System.StringComparison]::OrdinalIgnoreCase
                   )
                 ) {
 
-                  $relative = `
-                    $_.FullName.Substring(3)
+                  $relative =
+                    $fullPath.Substring(3)
 
-                  $destination = `
+                  $destination =
                     "$remote/D/$relative"
+                }
 
-                } else {
-
+                else {
                   return
                 }
 
+
                 Write-Host "FINAL BACKUP:"
-                Write-Host $_.FullName
+                Write-Host "$fullPath"
 
                 & $rclone copyto `
-                  "$($_.FullName)" `
+                  "$fullPath" `
                   "$destination" `
                   --config "$env:RCLONE_CONFIG" `
                   --retries 5 `
                   --low-level-retries 10 `
+                  --transfers 4 `
                   --stats 10s
               }
             }
@@ -794,35 +1116,93 @@ jobs:
 
           Write-Host "Final backup complete."
 
-      # ============================================================
-      # 17. VERIFY B2
-      # ============================================================
-      - name: Verify B2
+
+      # =========================================================
+      # 18. FINAL APP LIST
+      # =========================================================
+
+      - name: Final application backup
         shell: powershell
         env:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
         run: |
           $ErrorActionPreference = "Continue"
 
-          $rclone = "$env:RCLONE_DIR\rclone.exe"
+          $rclone =
+            "$env:RCLONE_DIR\rclone.exe"
+
+          $appsFile =
+            "$env:WORK_DIR\apps.json"
+
+          Write-Host "=========================================="
+          Write-Host "FINAL APPLICATION EXPORT"
+          Write-Host "=========================================="
+
+          winget export `
+            --output "$appsFile" `
+            --include-versions `
+            --accept-source-agreements
+
+          if (
+            $LASTEXITCODE -eq 0 -and
+            (Test-Path "$appsFile")
+          ) {
+
+            & $rclone copyto `
+              "$appsFile" `
+              "b2remote:$env:B2_BUCKET/apps/apps.json" `
+              --config "$env:RCLONE_CONFIG" `
+              --retries 5 `
+              --low-level-retries 10
+
+            Write-Host "Final apps.json backup finished."
+          }
+          else {
+
+            Write-Warning "Final winget export failed."
+          }
+
+
+      # =========================================================
+      # 19. VERIFY B2
+      # =========================================================
+
+      - name: Verify B2 backup
+        shell: powershell
+        env:
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          $rclone =
+            "$env:RCLONE_DIR\rclone.exe"
+
+          Write-Host "=========================================="
+          Write-Host "B2 BACKUP VERIFICATION"
+          Write-Host "=========================================="
+
 
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "B2 BACKUP SIZE"
-          Write-Host "=========================================="
-
+          Write-Host "GAME DATA:"
           & $rclone size `
             "b2remote:$env:B2_BUCKET/new-games" `
             --config "$env:RCLONE_CONFIG"
 
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "APPLICATION BACKUP"
-          Write-Host "=========================================="
 
+          Write-Host ""
+          Write-Host "APPLICATION DATA:"
           & $rclone size `
             "b2remote:$env:B2_BUCKET/apps" `
             --config "$env:RCLONE_CONFIG"
+
+
+          Write-Host ""
+          Write-Host "B2 CONTENT:"
+          & $rclone lsf `
+            "b2remote:$env:B2_BUCKET" `
+            --config "$env:RCLONE_CONFIG" `
+            --max-depth 2
+
 
           Write-Host ""
           Write-Host "=========================================="
