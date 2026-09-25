@@ -6,7 +6,7 @@ on:
 jobs:
   rdp:
     runs-on: windows-2022
-    timeout-minutes: 500
+    timeout-minutes: 350
 
     env:
       RCLONE_DIR: C:\Rclone
